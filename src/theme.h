@@ -22,6 +22,17 @@ inline constexpr StatusTone Offline{0xe2e6eb, 0x596779};
 inline constexpr UINT32 Surface = 0xfaf5fc;
 inline constexpr float TextReferenceBackground = .93f;
 
+inline void PaintFeedback(ID2D1RenderTarget *target, D2D1_RECT_F bounds,
+                          float opacity, float radius = 5) {
+  if (opacity <= 0)
+    return;
+  Microsoft::WRL::ComPtr<ID2D1SolidColorBrush> brush;
+  if (SUCCEEDED(
+          target->CreateSolidColorBrush(D2D1::ColorF(Accent, opacity), &brush)))
+    target->FillRoundedRectangle(D2D1::RoundedRect(bounds, radius, radius),
+                                 brush.Get());
+}
+
 // A milky tint balances native Acrylic visibility with a stable reading surface.
 // A fully opaque palette is reserved for the unavailable-material fallback.
 inline void PaintSurface(ID2D1RenderTarget *target, float width, float height,

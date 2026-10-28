@@ -14,6 +14,7 @@
 #include "frame_clock.h"
 #include "pet_canvas.h"
 #include "session_navigation.h"
+#include "interaction_motion.h"
 #include <deque>
 #include <chrono>
 #include <cmath>
@@ -41,6 +42,7 @@ HoverPolicy hover;
 std::deque<Session> completionQueue;
 std::wstring capsuleTitle, capsuleRecap;
 std::optional<Session> capsuleSession, panelPressed, noticePressed;
+std::wstring panelHotKey;
 bool capsuleAttention = false;
 StateClock stateClock;
 StateMotion stateMotion;
@@ -171,6 +173,39 @@ std::optional<Session> HitSession(HWND window, LPARAM position) {
   const int row = SessionRowAt(y / dpi, bounds.bottom / dpi, scroll,
                                snapshot.sessions.size());
   return row < 0 ? std::optional<Session>{} : snapshot.sessions[row];
+}
+std::wstring FeedbackKey(const Session &session) {
+  return session.workspace + L"\n" + session.id;
+}
+void UpdatePanelFeedback() {
+  POINT point;
+  GetCursorPos(&point);
+  const auto under = WindowFromPoint(point);
+  std::optional<Session> hit;
+  if (under == panel && PopupTargetVisible(panel)) {
+    ScreenToClient(panel, &point);
+    hit = HitSession(panel, MAKELPARAM(point.x, point.y));
+  }
+  const auto next = hit ? FeedbackKey(*hit) : L"";
+  if (!panelHotKey.empty() && panelHotKey != next)
+    SetInteractionFeedback(panel, panelHotKey, {}, 0);
+  panelHotKey = next;
+  if (hit) {
+    const bool down = panelPressed && SameSession(*panelPressed, *hit);
+    SetInteractionFeedback(panel, next, {true, down}, down ? .23f : .075f);
+  }
+}
+void UpdateNoticeFeedback() {
+  POINT point;
+  GetCursorPos(&point);
+  const bool hot =
+      PopupTargetVisible(capsule) && WindowFromPoint(point) == capsule;
+  const bool down = hot && noticePressed && capsuleSession &&
+                    SameSession(*noticePressed, *capsuleSession);
+  SetInteractionFeedback(capsule, L"body", {hot, down},
+                         down  ? .20f
+                         : hot ? .055f
+                               : 0);
 }
 // Experimental renderer: a real DirectWrite RGB coverage texture, encoded into
 // legal premultiplied BGRA using a reference backdrop (not exact live
@@ -584,6 +619,9 @@ void PaintPanel() {
         if (y + RowHeight < ListTop || y > height)
           continue;
         auto &session = snapshot.sessions[i];
+        PetTheme::PaintFeedback(
+            target.Get(), D2D1::RectF(4, y + 3, width - 4, y + RowHeight - 3),
+            InteractionOpacity(panel, FeedbackKey(session)));
         if (i + 1 < snapshot.sessions.size() && y + RowHeight < height) {
           brush->SetColor(D2D1::ColorF(PetTheme::Divider, .42f));
           target->DrawLine(D2D1::Point2F(RowSidePadding, y + RowHeight - .5f),
@@ -817,6 +855,8 @@ void ShowNextCompletion() {
   if (completionQueue.empty() || IsWindowVisible(capsule))
     return;
   auto notice = completionQueue.front();
+  ClearInteractionFeedback(capsule);
+  noticePressed.reset();
   capsuleSession = notice;
   capsuleAttention = notice.waiting;
   capsuleTitle = notice.title;
@@ -860,6 +900,8 @@ void HoverTick() {
   if (noticeVisible && (under == capsule || IsNoticeClose(under)))
     capsuleHoverUntil = now + 160;
   ShowNoticeClose(capsuleDpi, noticeVisible && now < capsuleHoverUntil);
+  UpdatePanelFeedback();
+  UpdateNoticeFeedback();
   UpdateAnimation();
 }
 void TickPanel() {
@@ -909,6 +951,9 @@ void PaintCapsule() {
     const float width = rc.right / dpi, height = rc.bottom / dpi;
     PetTheme::PaintSurface(target.Get(), width, height,
                            SUCCEEDED(capsuleMaterialResult));
+    PetTheme::PaintFeedback(target.Get(),
+                            D2D1::RectF(1, 1, width - 1, height - 1),
+                            InteractionOpacity(capsule, L"body"), 7);
     const float badgeY = height / 2;
     ComPtr<ID2D1SolidColorBrush> green;
     const auto tone = StateTone(capsuleAttention ? SessionState::Waiting
@@ -1022,12 +1067,14 @@ LRESULT CALLBACK CapsuleProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   case WM_LBUTTONDOWN:
     noticePressed = capsuleSession;
     SetCapture(h);
+    UpdateNoticeFeedback();
     return 0;
   case WM_LBUTTONUP: {
     auto pressed = noticePressed;
     noticePressed.reset();
     if (GetCapture() == h)
       ReleaseCapture();
+    UpdateNoticeFeedback();
     RECT bounds;
     GetClientRect(h, &bounds);
     POINT point{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
@@ -1038,6 +1085,16 @@ LRESULT CALLBACK CapsuleProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   }
   case WM_CAPTURECHANGED:
     noticePressed.reset();
+    UpdateNoticeFeedback();
+    return 0;
+  case WM_MOUSEMOVE: {
+    TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, h, 0};
+    TrackMouseEvent(&track);
+    UpdateNoticeFeedback();
+    return 0;
+  }
+  case WM_MOUSELEAVE:
+    SetInteractionFeedback(h,L"body",{},0);
     return 0;
   case WM_CLOSE:
     ShowNoticeClose(capsuleDpi, false);
@@ -1157,6 +1214,7 @@ LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     panelPressed = HitSession(h, l);
     if (panelPressed)
       SetCapture(h);
+    UpdatePanelFeedback();
     return 0;
   case WM_LBUTTONUP: {
     auto pressed = panelPressed;
@@ -1164,12 +1222,24 @@ LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     const auto released = HitSession(h, l);
     if (GetCapture() == h)
       ReleaseCapture();
+    UpdatePanelFeedback();
     if (pressed && released && SameSession(*pressed, *released))
       OpenSession(*pressed);
     return 0;
   }
   case WM_CAPTURECHANGED:
     panelPressed.reset();
+    UpdatePanelFeedback();
+    return 0;
+  case WM_MOUSEMOVE: {
+    TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, h, 0};
+    TrackMouseEvent(&track);
+    UpdatePanelFeedback();
+    return 0;
+  }
+  case WM_MOUSELEAVE:
+    if (!panelHotKey.empty()) SetInteractionFeedback(h,panelHotKey,{},0);
+    panelHotKey.clear();
     return 0;
   case WM_MOUSEWHEEL: {
     panelPressed.reset();
@@ -1180,6 +1250,7 @@ LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     scroll = std::clamp(scroll - GET_WHEEL_DELTA_WPARAM(w) / WHEEL_DELTA *
                                      (int)RowHeight * 2,
                         0, max);
+    UpdatePanelFeedback();
     InvalidateRect(h, nullptr, FALSE);
     return 0;
   }
@@ -1205,12 +1276,17 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     BeginVisualFrame();
     PulsePopupAnimations();
     TickPanel();
+    PulseInteractionFeedback();
     if (IsWindowVisible(panel))
       UpdateWindow(panel);
     ShowNoticeClose(capsuleDpi, PopupTargetVisible(capsule) &&
                                    GetTickCount64() < capsuleHoverUntil);
     return 0;
   case VisualFrameInfoQuery:
+    if (w == 3)
+      return FrameClockInteractionRequested();
+    if (w == 4)
+      return FrameClockFramesNeeded();
     return w == 0 ? FrameClockDisplayHz()
          : w == 1 ? FrameClockUsesVBlank()
                   : (LRESULT)std::lround(FrameClockAverageMs() * 100);
@@ -1345,6 +1421,7 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
           scroll, 0,
           std::max(0, ((int)snapshot.sessions.size() - VisibleRows()) *
                           (int)RowHeight));
+      UpdatePanelFeedback();
     }
     if (IsWindowVisible(panel)) {
       RECT r;
@@ -1379,6 +1456,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   GetModuleFileNameW(nullptr, path, 32768);
   base = fs::path(path).parent_path();
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  if (wcsstr(command, L"--interaction-motion-test"))
+    return InteractionMotionTests() ? 0 : 1;
   if (wcsstr(command, L"--navigation-test")) {
     DWORD pixels[] = {0, 0x00010203, 0xff345678, 0x02010101};
     KeepRectangularPetHitArea(pixels, 4);
@@ -1502,6 +1581,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
       << " vblankClock=" << SendMessageW(character, VisualFrameInfoQuery, 1, 0)
       << " visualFrameAverageMs="
       << SendMessageW(character, VisualFrameInfoQuery, 2, 0) / 100. << "\n";
+    f << "interactionFrames="
+      << SendMessageW(character, VisualFrameInfoQuery, 3, 0)
+      << " visualFramesNeeded="
+      << SendMessageW(character, VisualFrameInfoQuery, 4, 0) << "\n";
     f << "navigationCode=" << SendMessageW(character, NavigationQuery, 0, 0)
       << " navigationMatches=" << SendMessageW(character, NavigationQuery, 1, 0)
       << " navigationAction=" << SendMessageW(character, NavigationQuery, 2, 0)
@@ -1712,6 +1795,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   StopFrameClock();
   DestroyToolbar();
   ClearPopupAnimations();
+  ClearAllInteractionFeedback();
   DestroyNoticeClose();
   DestroyWindow(capsule);
   capsuleTarget.Reset();

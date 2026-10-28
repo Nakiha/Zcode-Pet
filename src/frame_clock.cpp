@@ -10,6 +10,7 @@
 using Microsoft::WRL::ComPtr;
 namespace {
 std::atomic_bool running = false, motion = false, continuous = false, pending = false;
+std::atomic_bool interaction = false;
 std::atomic<HMONITOR> currentMonitor = nullptr;
 std::atomic_uint generation = 0;
 std::atomic_int displayHz = 60;
@@ -31,7 +32,7 @@ double Now() {
   QueryPerformanceCounter(&value);
   return value.QuadPart / frequency;
 }
-bool Needed() { return motion.load() || continuous.load(); }
+bool Needed() { return motion.load() || continuous.load() || interaction.load(); }
 ComPtr<IDXGIOutput> OutputFor(HMONITOR monitor) {
   ComPtr<IDXGIFactory1> factory;
   if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
@@ -173,7 +174,18 @@ void BeginVisualFrame() {
   }
   lastUiFrame = now;
 }
+void RequestInteractionFrames(bool enabled) {
+  if (interaction.load() == enabled)
+    return;
+  {
+    std::lock_guard lock(mutex);
+    interaction = enabled;
+  }
+  wake.notify_all();
+}
 int FrameClockDisplayHz() { return displayHz; }
 bool FrameClockUsesVBlank() { return usingVBlank; }
 double FrameClockAverageMs() { return averageFrame; }
 double VisualClockMs() { return Now(); }
+bool FrameClockInteractionRequested() { return interaction; }
+bool FrameClockFramesNeeded() { return Needed(); }

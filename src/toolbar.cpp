@@ -4,6 +4,7 @@
 #include "floating_layout.h"
 #include "popup_motion.h"
 #include "ui_renderer.h"
+#include "interaction_motion.h"
 #include <windowsx.h>
 #include <wrl/client.h>
 #include <algorithm>
@@ -227,6 +228,29 @@ bool Selected(int id, const ToolbarState &s) {
                          (id == 6 && s.strength > .6f && s.strength < .9f) ||
                          (id == 7 && s.strength > .9f)));
 }
+std::wstring FeedbackKey(int id) { return L"button:" + std::to_wstring(id); }
+std::wstring SelectedKey(int id) { return L"selected:" + std::to_wstring(id); }
+void SyncFeedback() {
+  const auto items = Items();
+  const auto state = getState();
+  for (int i = 0; i < (int)items.size(); ++i) {
+    const auto id = items[i].id;
+    if (!id)
+      continue;
+    const bool active = Selected(id, state);
+    const bool hot = opened && (hovered == i || (keyMode && focus == i));
+    const bool down = hot && pressed == i;
+    const float opacity = active ? down  ? .32f
+                                   : hot ? .21f
+                                         : .18f
+                          : down ? .23f
+                          : hot  ? .09f
+                                 : 0;
+    SetInteractionFeedback(window, FeedbackKey(id), {hot, down}, opacity);
+    SetInteractionFeedback(window, SelectedKey(id), {active, false},
+                           active ? 1.f : 0);
+  }
+}
 void Paint() {
   PAINTSTRUCT ps;
   BeginPaint(window, &ps);
@@ -245,25 +269,19 @@ void Paint() {
     canvas->CreateSolidColorBrush(D2D1::ColorF(PetTheme::Ink), &brush);
     for (int i = 0; i < (int)items.size(); ++i) {
       auto item = items[i];
-      bool active = Selected(item.id, state);
-      bool hot = hovered == i || (keyMode && focus == i);
       float x = Inset + i * Cell;
-      if (active || hot) {
-        brush->SetColor(
-            D2D1::ColorF(PetTheme::Accent, active ? .18f : .09f));
-        canvas->FillRoundedRectangle(
-            D2D1::RoundedRect(D2D1::RectF(x + 2, 5, x + Cell - 2, 41), 8, 8),
-            brush.Get());
-      }
-      if (pressed == i) {
-        brush->SetColor(D2D1::ColorF(PetTheme::Accent, .14f));
-        canvas->FillRoundedRectangle(
-            D2D1::RoundedRect(D2D1::RectF(x + 2, 5, x + Cell - 2, 41), 8, 8),
-            brush.Get());
-      }
-      brush->SetColor(D2D1::ColorF(item.id == 4 ? PetTheme::Error.ink
-                                   : active     ? PetTheme::Accent
-                                                : PetTheme::Ink));
+      if (item.id)
+        PetTheme::PaintFeedback(
+            canvas.Get(), D2D1::RectF(x + 2, 5, x + Cell - 2, 41),
+            InteractionOpacity(window, FeedbackKey(item.id)), 8);
+      const auto amount = InteractionOpacity(window, SelectedKey(item.id));
+      const auto ink = D2D1::ColorF(PetTheme::Ink),
+                 accent = D2D1::ColorF(PetTheme::Accent);
+      brush->SetColor(item.id == 4
+                          ? D2D1::ColorF(PetTheme::Error.ink)
+                          : D2D1::ColorF(ink.r + (accent.r - ink.r) * amount,
+                                         ink.g + (accent.g - ink.g) * amount,
+                                         ink.b + (accent.b - ink.b) * amount));
       Icon(item.id, x + Cell / 2, 23, brush.Get());
     }
     int current = hovered >= 0 ? hovered : keyMode ? focus : -1;
@@ -312,7 +330,9 @@ void Activate(int index) {
     page = id == 100 ? 1 : id == 101 ? 2 : id == 102 ? 3 : 0;
     hovered = pressed = -1;
     focus = 0;
+    ClearInteractionFeedback(window);
     Fit(false);
+    SyncFeedback();
     return;
   }
   if (id == 4 || id == 3 || id == 1)
@@ -320,6 +340,7 @@ void Activate(int index) {
   execute(id);
   if (opened) {
     Fit(false);
+    SyncFeedback();
     // 尺寸操作会重新排列面板/胶囊的置顶顺序；工具栏仍应保持在它们前方。
     SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -358,12 +379,16 @@ LRESULT CALLBACK Proc(HWND h, UINT message, WPARAM w, LPARAM l) {
     if (hit != hovered || keyMode) {
       hovered = hit;
       keyMode = false;
+      SyncFeedback();
       InvalidateRect(h, nullptr, FALSE);
     }
     return 0;
   }
   case WM_LBUTTONDOWN:
     pressed = Hit(GET_X_LPARAM(l) / scale, GET_Y_LPARAM(l) / scale);
+    hovered = pressed;
+    keyMode = false;
+    SyncFeedback();
     if (pressed < 0)
       CloseToolbar();
     else
@@ -373,6 +398,7 @@ LRESULT CALLBACK Proc(HWND h, UINT message, WPARAM w, LPARAM l) {
     int hit = Hit(GET_X_LPARAM(l) / scale, GET_Y_LPARAM(l) / scale),
         was = pressed;
     pressed = -1;
+    SyncFeedback();
     if (hit >= 0 && was == hit)
       Activate(hit);
     else if (hit < 0)
@@ -389,6 +415,10 @@ LRESULT CALLBACK Proc(HWND h, UINT message, WPARAM w, LPARAM l) {
       return 0;
     }
     if (w == VK_RETURN || w == VK_SPACE) {
+      keyMode = true;
+      hovered = -1;
+      pressed = focus;
+      SyncFeedback();
       Activate(focus);
       return 0;
     }
@@ -402,6 +432,15 @@ LRESULT CALLBACK Proc(HWND h, UINT message, WPARAM w, LPARAM l) {
       do {
         focus = (focus + direction + (int)items.size()) % (int)items.size();
       } while (items[focus].id == 0);
+      SyncFeedback();
+      InvalidateRect(h, nullptr, FALSE);
+      return 0;
+    }
+    break;
+  case WM_KEYUP:
+    if (w == VK_RETURN || w == VK_SPACE) {
+      pressed = -1;
+      SyncFeedback();
       InvalidateRect(h, nullptr, FALSE);
       return 0;
     }
@@ -459,6 +498,8 @@ void ShowToolbar() {
   materialResult = applyMaterial(window);
   opened = true;
   ShowPopupAnimated(window, destination, scale);
+  ClearInteractionFeedback(window);
+  SyncFeedback();
   SetForegroundWindow(window);
   SetFocus(window);
   SetCapture(window);
@@ -468,17 +509,23 @@ void CloseToolbar() {
   if (!opened)
     return;
   opened = false;
+  hovered = pressed = -1;
+  keyMode = false;
+  SyncFeedback();
   if (GetCapture() == window)
     ReleaseCapture();
   HidePopupAnimated(window, scale);
 }
 bool IsToolbarOpen() { return opened; }
 void RefreshToolbarPlacement() {
-  if (opened)
+  if (opened) {
     Fit(false);
+    SyncFeedback();
+  }
 }
 void DestroyToolbar() {
   opened = false;
+  ClearInteractionFeedback(window);
   if (GetCapture() == window)
     ReleaseCapture();
   HidePopupImmediately(window);
