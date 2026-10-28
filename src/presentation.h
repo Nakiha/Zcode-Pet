@@ -180,6 +180,19 @@ inline const wchar_t *SelectPetAnimation(bool running, bool success,
                     : L"idle";
 }
 
+// The visual clock owns animated paints; the age timer owns resting updates.
+struct PanelFramePolicy {
+  bool hadMotion = false;
+  bool Tick(bool moving, bool contentChanged, bool visualFrame) {
+    const bool redraw = visualFrame ? moving || hadMotion || contentChanged
+                                    : !moving && !hadMotion && contentChanged;
+    if (visualFrame)
+      hadMotion = moving;
+    return redraw;
+  }
+  bool NeedsFrames(bool moving) const { return moving || hadMotion; }
+};
+
 // UI observes completed facts, never infers completion from disappearance.
 class CompletionTracker {
   int64_t startedAt;
@@ -253,6 +266,17 @@ struct HoverPolicy {
   }
 };
 inline bool PresentationTests() {
+  PanelFramePolicy frames;
+  if (frames.Tick(true, true, false) || !frames.NeedsFrames(true))
+    return false;
+  if (!frames.Tick(true, true, true))
+    return false;
+  if (frames.Tick(false, true, false) || !frames.NeedsFrames(false))
+    return false;
+  if (!frames.Tick(false, true, true) || frames.NeedsFrames(false))
+    return false;
+  if (!frames.Tick(false, true, false) || frames.Tick(false, false, false))
+    return false;
   if (ShortAge(10000) != L"10s" || ShortAge(120000) != L"2m" ||
       ShortAge(3600000) != L"1h")
     return false;

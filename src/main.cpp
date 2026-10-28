@@ -70,6 +70,10 @@ CompletionCelebrations celebrations;
 POINT panelDestination{};
 bool demo = false, preview = false, panelPinned = false;
 bool navigationPreview = false;
+std::wstring gpuProfileScene;
+bool gpuProfileNoAcrylic=false,gpuProfileNoShimmer=false,gpuProfileNoSpinner=false,
+     gpuProfileFrozenGif=false,gpuProfilePetOnly=false;
+uint64_t panelDraws=0,noticeDraws=0,petDraws=0,visualFrames=0;
 int64_t appStartedAt = 0;
 constexpr float PanelWidth = 312, RowHeight = 34, ListTop = 0,
                 SessionTextSize = 12;
@@ -139,7 +143,7 @@ void ReflowPopups();
 LRESULT CALLBACK CapsuleProc(HWND,UINT,WPARAM,LPARAM);
 constexpr UINT Refresh = WM_APP + 1, Tray = WM_APP + 2,
                NavigationCompleted = WM_APP + 30, NavigationQuery = WM_APP + 31,
-               NoticeInfoQuery=WM_APP+32;
+               NoticeInfoQuery=WM_APP+32,GpuRenderQuery=WM_APP+34;
 
 void NavigationFeedback(NavigationCode code) {
   NOTIFYICONDATAW icon{sizeof(icon)};
@@ -198,6 +202,7 @@ std::wstring FeedbackKey(const Session &session) {
   return session.workspace + L"\n" + session.id;
 }
 void UpdatePanelFeedback() {
+  if (!gpuProfileScene.empty()) return;
   POINT point;
   GetCursorPos(&point);
   const auto under = WindowFromPoint(point);
@@ -426,7 +431,7 @@ void Text(const std::wstring &s, float x, float y, float w, float h, float size,
     target->DrawTextLayout(D2D1::Point2F(x, originY), layout.Get(), brush.Get(),
                            D2D1_DRAW_TEXT_OPTIONS_CLIP);
   }
-  if (shimmer) {
+  if (shimmer && !gpuProfileNoShimmer) {
     // Highlight only the glyphs, with transparent ends so the deep base text
     // stays readable. This also preserves the experimental text's base pass.
     constexpr float band = 56;
@@ -545,24 +550,25 @@ void DrawIndicator(SessionState state, float x, float y,
   }
   target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 7.5f, 7.5f), brush);
   brush->SetColor(D2D1::ColorF(tone.ink));
+  const auto rounded=RoundStatusStroke(factory.Get());
   auto line = [&](float x1, float y1, float x2, float y2) {
     target->DrawLine(D2D1::Point2F(x + x1 * 1.6f, y + y1 * 1.6f),
                      D2D1::Point2F(x + x2 * 1.6f, y + y2 * 1.6f), brush,
-                     1.5f);
+                     1.5f,rounded);
   };
   if (state == SessionState::Completed) {
-    line(-2, 0, -.5f, 1.5f);
-    line(-.5f, 1.5f, 2, -1.5f);
+    DrawCheckMark(target.Get(),factory.Get(),brush,x,y,1.6f,1.5f);
   } else if (state == SessionState::Error) {
     line(-1.5f, -1.5f, 1.5f, 1.5f);
     line(-1.5f, 1.5f, 1.5f, -1.5f);
   } else if (state == SessionState::Interrupted)
     line(-2, 0, 2, 0);
   else if (state == SessionState::Waiting) {
-    line(0, -2, 0, .5f);
-    target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y + 3.7f), .85f, .85f),
+    target->DrawLine(D2D1::Point2F(x,y-3.2f),D2D1::Point2F(x,y+.8f),brush,1.8f,rounded);
+    target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y + 3.7f), .95f, .95f),
                         brush);
   } else if (state == SessionState::Running) {
+    if (gpuProfileNoSpinner) return;
     constexpr float Pi = 3.141592654f, radius = 3.8f;
     const float angle = (float)std::fmod(VisualClockMs(), 1200.) * (2 * Pi / 1200);
     auto point = [&](float a) {
@@ -579,7 +585,7 @@ void DrawIndicator(SessionState state, float x, float y,
           D2D1_SWEEP_DIRECTION_CLOCKWISE, D2D1_ARC_SIZE_LARGE));
       sink->EndFigure(D2D1_FIGURE_END_OPEN);
       if (SUCCEEDED(sink->Close()))
-        target->DrawGeometry(arc.Get(), brush, 1.5f);
+        target->DrawGeometry(arc.Get(), brush, 1.8f,rounded);
     }
   } else if (state == SessionState::Unknown)
     for (float dx : {-2.6f, 0.f, 2.6f})
@@ -594,9 +600,10 @@ HRESULT ApplySurfaceMaterial(HWND surface) {
   // region or AccentPolicy: both can leave a detached rectangular material.
   DWMNCRENDERINGPOLICY policy = DWMNCRP_ENABLED;
   DwmSetWindowAttribute(surface, DWMWA_NCRENDERING_POLICY, &policy, sizeof(policy));
-  DWM_SYSTEMBACKDROP_TYPE material = DWMSBT_TRANSIENTWINDOW;
+  DWM_SYSTEMBACKDROP_TYPE material = gpuProfileNoAcrylic ? DWMSBT_NONE : DWMSBT_TRANSIENTWINDOW;
   HRESULT hr = DwmSetWindowAttribute(surface, DWMWA_SYSTEMBACKDROP_TYPE,
                                      &material, sizeof(material));
+  if (gpuProfileNoAcrylic) hr=E_FAIL;
   if (surface == panel)
     panelMaterialResult = hr;
   if (auto notice=FindNotice(surface))
@@ -612,6 +619,7 @@ HRESULT ApplySurfaceMaterial(HWND surface) {
   return hr;
 }
 void PaintPanel() {
+  ++panelDraws;
   PAINTSTRUCT ps;
   BeginPaint(panel, &ps);
   RECT rc;
@@ -692,6 +700,7 @@ void PaintPanel() {
   EndPaint(panel, &ps);
 }
 void DrawPet() {
+  ++petDraws;
   if (!animation)
     return;
   int side = (int)(petSize * GetDpiForWindow(pet) / 96.f);
@@ -755,7 +764,8 @@ void SetAnimation(const std::wstring &name) {
     }
   }
   DrawPet();
-  SetTimer(pet, 1, delays[0], nullptr);
+  if (gpuProfileFrozenGif) KillTimer(pet,1);
+  else SetTimer(pet, 1, delays[0], nullptr);
 }
 void DismissPanel() {
   if (panelPinned) {
@@ -852,10 +862,14 @@ void PlaceNoticeWindows(bool snap = false) {
     notice->destination =
         PlaceAvoidingWindows(preferred, {width, height}, monitor.rcWork,
                              occupied, edge, gap, {outset, outset});
-    PlacePopup(notice->window, notice->destination, {width, height});
-    if (snap)
+    if (snap) {
+      PlacePopup(notice->window, notice->destination, {width, height});
       SnapPopupPlacement(notice->window);
-    auto bounds = PopupAnimationBounds(notice->window);
+    } else
+      RepositionPopupAnimated(notice->window,notice->destination,{width,height});
+    // 同组气泡按最终槽位规划，让所有后续气泡同时补位；对工具栏等外部窗口
+    // 仍使用 PopupAnimationBounds 的整段运动范围，避免中途穿插。
+    const auto bounds=FloatingFootprint(notice->destination,{width,height});
     // 同列主体之间共享 8 DIP 间距。外伸关闭钮只用于屏幕/工具栏避让，
     // 不能把它的整块包围盒和静态动画余量重复累加到每条气泡之间。
     occupied.push_back(bounds);
@@ -909,6 +923,7 @@ void TogglePanel() {
     ShowPanel();
 }
 void UpdateAnimation() {
+  if (!gpuProfileScene.empty()) { SetAnimation(L"working"); return; }
   const auto now = GetTickCount64();
   if (celebrations.Advance(now) && animationName == L"success")
     animationName.clear();
@@ -966,9 +981,13 @@ void CloseNotice(HWND window) {
   notice->closing = true;
   notice->pressed.reset();
   notice->hoverUntil = 0;
-  ShowNoticeClose(window, notice->scale, false);
+  RetireNoticeClose(window);
   SetInteractionFeedback(window, L"body", {}, 0);
   HidePopupAnimated(window, notice->scale);
+  // 某条补位中的气泡关闭后，将其当前位置作为退场障碍重新规划，
+  // 防止后面的气泡继续驶向被它暂时占用的路径。
+  PlaceNoticeWindows();
+  RefreshToolbarPlacement();
 }
 void ReapNotices() {
   bool removed = false;
@@ -1016,6 +1035,7 @@ void HoverTick() {
   bool show = hover.Update(inside, dragging, GetTickCount64(), panelPinned);
   if (preview && !dragging)
     show = true;
+  if (!gpuProfileScene.empty()) show=!gpuProfilePetOnly;
   if (show && !PopupTargetVisible(panel))
     ShowPanel();
   if (!show && PopupTargetVisible(panel))
@@ -1026,15 +1046,16 @@ void HoverTick() {
   UpdatePanelFeedback();
   UpdateAnimation();
 }
-void TickPanel() {
+bool TickPanel(bool visualFrame = false) {
+  static std::vector<std::wstring> previousAges;
+  static PanelFramePolicy frames;
   if (!IsWindowVisible(panel)) {
+    frames.hadMotion = false;
     RequestContinuousFrames(false);
-    return;
+    return false;
   }
   // State observation stays at two seconds; visual time and the loading arc
   // follow their own UI cadence and always use elapsed time, never tick counts.
-  static std::vector<std::wstring> previousAges;
-  static bool wasTransitioning = false;
   std::vector<std::wstring> ages;
   bool loading = false;
   bool transitioning = false;
@@ -1048,14 +1069,19 @@ void TickPanel() {
     loading |= StateOf(session, snapshot.online) == SessionState::Running;
     transitioning |= stateMotion.Active(session, animationNow);
   }
-  // Draw one final resting frame after the hop has ended.
-  if (loading || transitioning || wasTransitioning || ages != previousAges)
+  // 动画由垂直同步独占重绘，避免 100 ms 定时器叠加成 120 + 10 Hz。
+  // Keep one final resting frame pending until the visual clock consumes it.
+  const bool moving = loading || transitioning;
+  if (frames.Tick(moving, ages != previousAges, visualFrame)) {
     InvalidateRect(panel, nullptr, FALSE);
-  RequestContinuousFrames(loading || transitioning);
-  previousAges = std::move(ages);
-  wasTransitioning = transitioning;
+    previousAges = std::move(ages);
+  }
+  const bool continuous = frames.NeedsFrames(moving);
+  RequestContinuousFrames(continuous);
+  return continuous;
 }
 void PaintCapsule(HWND window) {
+  ++noticeDraws;
   auto notice = FindNotice(window);
   if (!notice)
     return;
@@ -1094,20 +1120,14 @@ void PaintCapsule(HWND window) {
     if (capsuleAttention) {
       target->DrawLine(D2D1::Point2F(badgeX, badgeY - 4 * glyphScale),
                        D2D1::Point2F(badgeX, badgeY + glyphScale), green.Get(),
-                       2.f * glyphScale);
+                       2.f * glyphScale,RoundStatusStroke(factory.Get()));
       target->FillEllipse(
           D2D1::Ellipse(D2D1::Point2F(badgeX, badgeY + 4.5f * glyphScale),
-                        glyphScale, glyphScale),
+                        1.1f*glyphScale, 1.1f*glyphScale),
           green.Get());
     } else {
-      target->DrawLine(
-          D2D1::Point2F(badgeX - 5 * glyphScale, badgeY),
-          D2D1::Point2F(badgeX - 1.5f * glyphScale, badgeY + 3.3f * glyphScale),
-          green.Get(), 2.f * glyphScale);
-      target->DrawLine(
-          D2D1::Point2F(badgeX - 1.5f * glyphScale, badgeY + 3.3f * glyphScale),
-          D2D1::Point2F(badgeX + 5 * glyphScale, badgeY - 4 * glyphScale),
-          green.Get(), 2.f * glyphScale);
+      DrawCheckMark(target.Get(),factory.Get(),green.Get(),badgeX,badgeY,
+                      2.5f*glyphScale,2.f*glyphScale);
     }
     std::wstring title = capsuleTitle.empty() ? L"未命名会话" : capsuleTitle;
     if (title.size() > 44) {
@@ -1412,6 +1432,11 @@ LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 }
 LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   switch (msg) {
+  case GpuRenderQuery:
+    if (w == 4)
+      return (LRESULT)std::llround(VisualClockMs() * 1000);
+    return w==0 ? (LRESULT)panelDraws : w==1 ? (LRESULT)noticeDraws
+         : w==2 ? (LRESULT)petDraws : (LRESULT)visualFrames;
   case NoticeInfoQuery: {
     if (w == 5)
       return (LRESULT)celebrations.pending;
@@ -1445,9 +1470,10 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                     : SessionNavigationBusy();
   }
   case VisualFrameMessage:
+    ++visualFrames;
     BeginVisualFrame();
     PulsePopupAnimations();
-    TickPanel();
+    TickPanel(true);
     PulseInteractionFeedback();
     if (IsWindowVisible(panel))
       UpdateWindow(panel);
@@ -1462,12 +1488,14 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
          : w == 1 ? FrameClockUsesVBlank()
                   : (LRESULT)std::lround(FrameClockAverageMs() * 100);
   case PopupFrameTimeQuery:
+    if (w!=0) return PopupReflowMetric(w);
     return (LRESULT)std::lround(PopupAverageFrameMs() * 100);
   case WM_TIMER:
     if (w == 2) {
       HoverTick();
       return 0;
     }
+    if (gpuProfileFrozenGif && w==1) return 0;
     if (animation && count) {
       frame = (frame + 1) % count;
       animation->SelectActiveFrame(&Gdiplus::FrameDimensionTime, frame);
@@ -1621,8 +1649,8 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     }
     ShowIncomingNotices();
     UpdateAnimation();
-    TickPanel();
-    InvalidateRect(panel, nullptr, FALSE);
+    if (!TickPanel())
+      InvalidateRect(panel, nullptr, FALSE);
     return 0;
   }
   case WM_DESTROY:
@@ -1813,6 +1841,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
       << SendMessageW(character, VisualFrameInfoQuery, 3, 0)
       << " visualFramesNeeded="
       << SendMessageW(character, VisualFrameInfoQuery, 4, 0) << "\n";
+    f << "reflowStarts=" << SendMessageW(character,PopupFrameTimeQuery,4,0)
+      << " reflowFrames=" << SendMessageW(character,PopupFrameTimeQuery,1,0)
+      << " reflowAverageMs=" << SendMessageW(character,PopupFrameTimeQuery,2,0)/100.
+      << " reflowActive=" << SendMessageW(character,PopupFrameTimeQuery,3,0) << "\n";
     f << "navigationCode=" << SendMessageW(character, NavigationQuery, 0, 0)
       << " navigationMatches=" << SendMessageW(character, NavigationQuery, 1, 0)
       << " navigationAction=" << SendMessageW(character, NavigationQuery, 2, 0)
@@ -1833,6 +1865,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
       << SendMessageW(character, NoticeInfoQuery, 5, 0)
       << " petAnimation=" << SendMessageW(character, NoticeInfoQuery, 6, 0)
       << "\n";
+    f << "panelDraws=" << SendMessageW(character,GpuRenderQuery,0,0)
+      << " noticeDraws=" << SendMessageW(character,GpuRenderQuery,1,0)
+      << " petDraws=" << SendMessageW(character,GpuRenderQuery,2,0)
+      << " visualFrames=" << SendMessageW(character,GpuRenderQuery,3,0)
+      << " renderTimeMicros=" << SendMessageW(character,GpuRenderQuery,4,0) << "\n";
     return s.error.empty() ? 0 : 2;
   }
   if (wcsstr(command, L"--quit")) {
@@ -1842,6 +1879,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
     return 0;
   }
   demo = wcsstr(command, L"--demo") != nullptr;
+  if (const auto flag=wcsstr(command,L"--gpu-profile=")) {
+    const auto value=flag+wcslen(L"--gpu-profile=");
+    const auto end=wcspbrk(value,L" \t");
+    gpuProfileScene.assign(value,end ? end-value : wcslen(value));
+    gpuProfilePetOnly=gpuProfileScene.rfind(L"pet",0)==0;
+    gpuProfileFrozenGif=gpuProfileScene.find(L"frozen")!=std::wstring::npos;
+    gpuProfileNoAcrylic=gpuProfileScene.find(L"no-acrylic")!=std::wstring::npos;
+    gpuProfileNoShimmer=gpuProfileScene.find(L"no-shimmer")!=std::wstring::npos;
+    gpuProfileNoSpinner=gpuProfileScene.find(L"no-spinner")!=std::wstring::npos;
+  }
   preview = wcsstr(command, L"--preview") != nullptr;
   navigationPreview =
       preview && !demo && wcsstr(command, L"--navigation-preview");
@@ -1925,7 +1972,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
     while (!quitting) {
       Snapshot s;
       try {
-        if (demo) {
+        if (!gpuProfileScene.empty()) {
+          s.online=true;
+          for (int i=0;i<3;++i) {
+            Session fixture;
+            fixture.id=L"gpu-profile-"+std::to_wstring(i); fixture.workspace=L"gpu-profile";
+            fixture.title=L"GPU 固定场景 "+std::to_wstring(i+1); fixture.path=L"GPU profile";
+            fixture.running=gpuProfileScene.rfind(L"running",0)==0;
+            if (fixture.running) fixture.startedAt=appStartedAt;
+            else { fixture.result=L"completed"; fixture.endedAt=appStartedAt-3600000; }
+            s.sessions.push_back(std::move(fixture));
+          }
+        } else if (demo) {
           s.online = true;
           const auto demoAge = GetTickCount64() - demoStart;
           Session a;
@@ -2025,7 +2083,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
         Sleep(100);
     }
   });
-  if (panelPinned || wcsstr(command, L"--panel"))
+  if (!gpuProfileScene.empty() ? !gpuProfilePetOnly : panelPinned || wcsstr(command,L"--panel"))
     TogglePanel();
   MSG message;
   while (GetMessageW(&message, nullptr, 0, 0) > 0) {

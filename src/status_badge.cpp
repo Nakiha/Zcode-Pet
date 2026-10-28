@@ -5,6 +5,52 @@
 #include <deque>
 #include <cmath>
 using Microsoft::WRL::ComPtr;
+ID2D1StrokeStyle *RoundStatusStroke(ID2D1Factory *graphics) {
+  static ComPtr<ID2D1Factory> owner;
+  static ComPtr<ID2D1StrokeStyle> style;
+  if (owner.Get() != graphics) {
+    style.Reset();
+    owner = graphics;
+  }
+  if (!style)
+    graphics->CreateStrokeStyle(
+        D2D1::StrokeStyleProperties(D2D1_CAP_STYLE_ROUND, D2D1_CAP_STYLE_ROUND,
+                                    D2D1_CAP_STYLE_ROUND, D2D1_LINE_JOIN_ROUND),
+        nullptr, 0, &style);
+  return style.Get();
+}
+void DrawCheckMark(ID2D1RenderTarget *target, ID2D1Factory *graphics,
+                   ID2D1Brush *brush, float x, float y, float scale,
+                   float strokeWidth) {
+  static ComPtr<ID2D1Factory> owner;
+  static ComPtr<ID2D1PathGeometry> path;
+  if (owner.Get() != graphics) {
+    path.Reset();
+    owner = graphics;
+  }
+  if (!path) {
+    ComPtr<ID2D1PathGeometry> created;
+    ComPtr<ID2D1GeometrySink> sink;
+    if (FAILED(graphics->CreatePathGeometry(&created)) ||
+        FAILED(created->Open(&sink)))
+      return;
+    // 同一个 figure 内连续折线才有连接处；独立 DrawLine 的平端帽会在拐角留洞。
+    sink->BeginFigure(D2D1::Point2F(-2, 0), D2D1_FIGURE_BEGIN_HOLLOW);
+    sink->AddLine(D2D1::Point2F(-.5f, 1.5f));
+    sink->AddLine(D2D1::Point2F(2, -1.5f));
+    sink->EndFigure(D2D1_FIGURE_END_OPEN);
+    if (FAILED(sink->Close()))
+      return;
+    path = created;
+  }
+  const auto style = RoundStatusStroke(graphics);
+  D2D1_MATRIX_3X2_F previous;
+  target->GetTransform(&previous);
+  target->SetTransform(D2D1::Matrix3x2F::Scale(scale, scale) *
+                       D2D1::Matrix3x2F::Translation(x, y) * previous);
+  target->DrawGeometry(path.Get(), brush, strokeWidth / scale, style);
+  target->SetTransform(previous);
+}
 namespace {
 class Outlines final : public IDWriteTextRenderer {
   ULONG refs = 1;
@@ -93,7 +139,7 @@ public:
   }
 };
 ComPtr<ID2D1GeometryGroup> LayoutOutlines(ID2D1Factory *graphics,
-                                         IDWriteTextLayout *layout) {
+                                          IDWriteTextLayout *layout) {
   auto renderer = new Outlines(graphics);
   HRESULT hr = layout->Draw(nullptr, renderer, 0, 0);
   std::vector<ID2D1Geometry *> raw;
@@ -102,7 +148,7 @@ ComPtr<ID2D1GeometryGroup> LayoutOutlines(ID2D1Factory *graphics,
   ComPtr<ID2D1GeometryGroup> glyphs;
   if (SUCCEEDED(hr) && !raw.empty())
     graphics->CreateGeometryGroup(D2D1_FILL_MODE_WINDING, raw.data(),
-                                   (UINT32)raw.size(), &glyphs);
+                                  (UINT32)raw.size(), &glyphs);
   renderer->Release();
   return glyphs;
 }
@@ -152,13 +198,13 @@ Shape Build(ID2D1Factory *graphics, IDWriteFactory *text,
 }
 } // namespace
 bool TextInkBounds(ID2D1Factory *graphics, IDWriteTextLayout *layout,
-                    D2D1_RECT_F &bounds) {
+                   D2D1_RECT_F &bounds) {
   auto glyphs = LayoutOutlines(graphics, layout);
   return glyphs && SUCCEEDED(glyphs->GetBounds(nullptr, &bounds)) &&
          bounds.right > bounds.left && bounds.bottom > bounds.top;
 }
 float CenteredTextOriginY(ID2D1Factory *graphics, IDWriteTextLayout *layout,
-                           float height) {
+                          float height) {
   D2D1_RECT_F ink{};
   if (TextInkBounds(graphics, layout, ink))
     return (height - ink.top - ink.bottom) / 2;
@@ -184,7 +230,8 @@ bool DrawStatusBadge(ID2D1RenderTarget *target, ID2D1Factory *graphics,
   Shape shape;
   for (const auto &entry : cache)
     if (entry.graphics == graphics && entry.text == text &&
-        entry.label == label && entry.width == width && entry.height == height) {
+        entry.label == label && entry.width == width &&
+        entry.height == height) {
       shape = entry.shape;
       break;
     }

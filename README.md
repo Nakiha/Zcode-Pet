@@ -44,6 +44,8 @@
 
 所有气泡与 Sessions 面板物理宽度相同，统一跟随系统 DPI、面板缩放及屏幕限宽。内容共用会话行的 34 DIP 标题起点、18 DIP 徽章中心、10 DIP 右边距；完成气泡与单行 session 等高，双行等待气泡仅增加一个行距，徽章保留原有实际大小。气泡间及气泡与 Sessions 之间的可见间距统一为 8 个系统 DIP，不重复叠加关闭钮或动画余量。左上角关闭钮维持外伸布局，屏幕边缘及工具栏避让仍计入按钮占用，整组跟随宠物移动。表面沿用原生圆角、亚克力和系统投影；220 ms 进场、110 ms 退场以及 hover/press 仍由显示器垂直同步驱动。
 
+手动关闭或新一轮自动清理后，剩余气泡使用 200 ms CSS ease-out 同步平滑补位，复用屏幕刷新率时钟。连续关闭会从当前显示位置重新定向，正在补位的气泡被关闭时从当前位置退场，关闭钮逐帧跟随；同目标刷新不重启动画，结束后停止请求帧。最终间距保持 8 DIP；拖动宠物时直接跟随。关闭钮沿用原有大小和左上角位置，hover 提亮、press 压暗，复用交互动效与屏幕刷新率时钟；点中后带按下反馈随气泡退场。会话与气泡里的勾统一使用连续路径及圆角连接，避免拐角缺口；加载弧线和感叹号也采用圆头及稍饱满的线宽/圆点，状态底圆和布局不变。
+
 ## 亚克力文字实验
 
 默认 DirectWrite 灰度 AA，直接绘制在透明亚克力表面。
@@ -65,6 +67,10 @@ ctest --test-dir build -C Release --output-on-failure
 ```
 
 `ZCodePet.exe --probe` 只读检查观察器、浮层布局、实际渲染后端及帧时钟，并写 EXE 旁边的 `probe.txt`，不输出会话标题或内容。可查看 displayHz、vblankClock、visualFrameAverageMs、panelCenterOffset 和各 renderer 字段。`--self-test` 验证回合顺序和覆盖率数学；`--panel` 启动时展开面板。`--quit` 正常退出已运行的桌宠。
+
+GPU 对照诊断：`scripts/profile-gpu.ps1 -Exe .\build\Release\ZCodePet.exe -OutputDirectory .\build\gpu-profile`。脚本依次重启到本地固定场景，采集 Windows GPU 引擎原始计数器、进程 CPU/显存及绘制次数，写入 summary.json/csv、engine-samples.csv，最后恢复正常面板；当前脚本需要 NVIDIA 的 nvidia-smi 记录整卡快照。可用 `-RestoreExe` 指定恢复运行的便携版，`-Scenes` 限定场景、`-Samples` 调整每场景采样数。显式 `--gpu-profile=<scene>` 支持 pet、pet-frozen、static、running，以及 running 后追加 no-shimmer/no-spinner/no-acrylic/frozen-gif 的组合，仅用于诊断；不读写 ZCode、不修改用户设置。
+
+2026-10-29 本机 RTX 5080 / 120 Hz、三行运行中场景实测：修复重复绘制前，桌宠自身 3D 引擎约 2.98–3.01%；修复后两轮约 2.67–2.70%，面板绘制稳定 120 次/秒。关闭标题扫光的对照约 2.02%，静态面板约 0.009%，仅 GIF 的对照接近 0%。主要成本是运行中面板持续整面重绘，标题扫光有额外成本。移除转圈或亚克力的对照没有显示显著的应用自身 3D 降幅；系统 DWM 的亚克力合成成本不能据此排除。GIF 按原素材约 31 次/秒上传，仍包含 CPU 绘制与系统合成开销。测量时 Sunshine 持续编码、其他桌面程序保持运行，数据用于本机相对对照，不代表通用性能或整卡功耗归因。正常模式保留全部视觉效果及刷新率，只去掉 100 ms 定时器和两秒快照重复插入的动画面板重绘。
 
 `--demo --preview --panel` 使用本地演示事件：8 秒首个会话完成、10 秒第二个会话完成，另一个会话持续工作；12 秒新增等待提醒，14 秒重命名首个会话，18 秒首个会话进入新一轮并清理旧完成提醒。可验证多气泡、完成动画、名称同步、单独关闭及新轮清理，不给 ZCode 发任务或写入状态。正式运行不加 demo/preview。
 
