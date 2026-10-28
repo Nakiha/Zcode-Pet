@@ -159,6 +159,9 @@ void ClearPopupAnimations() {
   motions.clear();
   RequestMotionFrames(false);
 }
+void ForgetPopupAnimation(HWND window) {
+  motions.erase(window); UpdateActivity();
+}
 void PulsePopupAnimations() {
   for (const auto &[window, motion] : motions) {
     (void)motion;

@@ -30,4 +30,5 @@ inline LRESULT Backend(HWND window) {
   auto i = backends.find(window);
   return i == backends.end() ? -1 : (LRESULT)i->second;
 }
+inline void Forget(HWND window) { backends.erase(window); }
 } // namespace UiRenderer

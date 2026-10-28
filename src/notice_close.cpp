@@ -4,13 +4,19 @@
 #include <gdiplus.h>
 #include <windowsx.h>
 #include <algorithm>
+#include <map>
+#include <memory>
 
 namespace {
-HWND button, owner;
-float scale = 0;
-bool pressed = false;
+struct CloseButton {
+  HWND button = nullptr, owner = nullptr;
+  float scale = 0;
+  bool pressed = false;
+};
+std::map<HWND, std::unique_ptr<CloseButton>> buttons;
 
-void Paint(float dpi) {
+void Paint(CloseButton &state, float dpi) {
+  const auto button = state.button;
   if (!button || dpi <= 0)
     return;
   const int side = std::max(1, (int)(24 * dpi));
@@ -18,7 +24,8 @@ void Paint(float dpi) {
   BITMAPINFO info{};
   info.bmiHeader = {sizeof(BITMAPINFOHEADER), side, -side, 1, 32, BI_RGB};
   void *bits = nullptr;
-  HBITMAP image = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+  HBITMAP image =
+      CreateDIBSection(screen, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
   if (image && bits) {
     auto previous = SelectObject(memory, image);
     {
@@ -28,8 +35,8 @@ void Paint(float dpi) {
       g.Clear(Gdiplus::Color(0, 0, 0, 0));
       g.ScaleTransform(dpi, dpi);
       g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-      Gdiplus::SolidBrush fill(pressed ? Gdiplus::Color(255, 56, 49, 68)
-                                       : Gdiplus::Color(248, 78, 70, 91));
+      Gdiplus::SolidBrush fill(state.pressed ? Gdiplus::Color(255, 56, 49, 68)
+                                             : Gdiplus::Color(248, 78, 70, 91));
       Gdiplus::Pen edge(Gdiplus::Color(170, 232, 222, 244), .85f);
       Gdiplus::Pen cross(Gdiplus::Color(255, 255, 255, 255), 1.8f);
       cross.SetStartCap(Gdiplus::LineCapRound);
@@ -43,39 +50,48 @@ void Paint(float dpi) {
     SIZE size{side, side};
     BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
     UpdateLayeredWindow(button, screen, nullptr, &size, memory, &origin, 0,
-                          &blend, ULW_ALPHA);
+                        &blend, ULW_ALPHA);
     SelectObject(memory, previous);
   }
   if (image)
     DeleteObject(image);
   DeleteDC(memory);
   ReleaseDC(nullptr, screen);
-  scale = dpi;
+  state.scale = dpi;
 }
 
 LRESULT CALLBACK Proc(HWND h, UINT message, WPARAM w, LPARAM l) {
+  if (message == WM_NCCREATE) {
+    const auto create = reinterpret_cast<CREATESTRUCTW *>(l);
+    SetWindowLongPtrW(h, GWLP_USERDATA,
+                      reinterpret_cast<LONG_PTR>(create->lpCreateParams));
+  }
+  auto state =
+      reinterpret_cast<CloseButton *>(GetWindowLongPtrW(h, GWLP_USERDATA));
+  if (!state)
+    return DefWindowProcW(h, message, w, l);
   switch (message) {
   case WM_MOUSEACTIVATE:
     return MA_NOACTIVATE;
   case WM_LBUTTONDOWN:
-    pressed = true;
+    state->pressed = true;
     SetCapture(h);
-    Paint(scale);
+    Paint(*state, state->scale);
     return 0;
   case WM_LBUTTONUP: {
-    const bool wasPressed = pressed;
-    const float x = GET_X_LPARAM(l) / scale - 12,
-                y = GET_Y_LPARAM(l) / scale - 12;
-    pressed = false;
+    const bool wasPressed = state->pressed;
+    const float x = GET_X_LPARAM(l) / state->scale - 12,
+                y = GET_Y_LPARAM(l) / state->scale - 12;
+    state->pressed = false;
     ReleaseCapture();
-    Paint(scale);
+    Paint(*state, state->scale);
     if (wasPressed && x * x + y * y <= 144)
-      PostMessageW(owner, WM_CLOSE, 0, 0);
+      PostMessageW(state->owner, WM_CLOSE, 0, 0);
     return 0;
   }
   case WM_CAPTURECHANGED:
-    pressed = false;
-    Paint(scale);
+    state->pressed = false;
+    Paint(*state, state->scale);
     return 0;
   }
   return DefWindowProcW(h, message, w, l);
@@ -83,20 +99,27 @@ LRESULT CALLBACK Proc(HWND h, UINT message, WPARAM w, LPARAM l) {
 } // namespace
 
 void InitNoticeClose(HWND notice, bool preview) {
-  owner = notice;
+  auto state = std::make_unique<CloseButton>();
+  state->owner = notice;
   WNDCLASSW wc{};
   wc.hInstance = GetModuleHandleW(nullptr);
   wc.hCursor = LoadCursorW(nullptr, IDC_HAND);
   wc.lpfnWndProc = Proc;
   wc.lpszClassName = L"ZCodePet.NoticeClose";
   RegisterClassW(&wc);
-  button = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST |
-                               (preview ? WS_EX_APPWINDOW
-                                          : WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE),
-                           wc.lpszClassName, L"关闭提醒", WS_POPUP, 0, 0, 24,
-                           24, owner, nullptr, wc.hInstance, nullptr);
+  state->button = CreateWindowExW(
+      WS_EX_LAYERED | WS_EX_TOPMOST |
+          (preview ? WS_EX_APPWINDOW : WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE),
+      wc.lpszClassName, L"关闭提醒", WS_POPUP, 0, 0, 24, 24, notice, nullptr,
+      wc.hInstance, state.get());
+  buttons.emplace(notice, std::move(state));
 }
-void ShowNoticeClose(float dpi, bool visible) {
+void ShowNoticeClose(HWND notice, float dpi, bool visible) {
+  auto found = buttons.find(notice);
+  if (found == buttons.end())
+    return;
+  auto &state = *found->second;
+  const auto button = state.button;
   if (!button)
     return;
   if (!visible) {
@@ -104,23 +127,30 @@ void ShowNoticeClose(float dpi, bool visible) {
       ShowWindow(button, SW_HIDE);
     return;
   }
-  if (scale != dpi)
-    Paint(dpi);
+  if (state.scale != dpi)
+    Paint(state, dpi);
   RECT bounds;
-  GetWindowRect(owner, &bounds);
+  GetWindowRect(notice, &bounds);
   const int x = bounds.left - (int)(12 * dpi), y = bounds.top - (int)(12 * dpi),
             side = (int)(24 * dpi);
   RECT current;
   GetWindowRect(button, &current);
   if (IsWindowVisible(button) && current.left == x && current.top == y &&
-      current.right - current.left == side && current.bottom - current.top == side)
+      current.right - current.left == side &&
+      current.bottom - current.top == side)
     return;
   SetWindowPos(button, HWND_TOPMOST, x, y, side, side,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
+               SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
-bool IsNoticeClose(HWND window) { return button && window == button; }
-void DestroyNoticeClose() {
-  if (button)
-    DestroyWindow(button);
-  button = nullptr;
+bool IsNoticeClose(HWND notice, HWND window) {
+  auto found = buttons.find(notice);
+  return found != buttons.end() && found->second->button == window;
+}
+void DestroyNoticeClose(HWND notice) {
+  auto found = buttons.find(notice);
+  if (found == buttons.end())
+    return;
+  if (found->second->button)
+    DestroyWindow(found->second->button);
+  buttons.erase(found);
 }

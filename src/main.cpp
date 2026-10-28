@@ -15,6 +15,7 @@
 #include "pet_canvas.h"
 #include "session_navigation.h"
 #include "interaction_motion.h"
+#include "notice_model.h"
 #include <deque>
 #include <chrono>
 #include <cmath>
@@ -35,19 +36,38 @@
 using Microsoft::WRL::ComPtr;
 namespace fs = std::filesystem;
 HINSTANCE instance;
-HWND pet, panel, capsule;
-ComPtr<ID2D1HwndRenderTarget> capsuleTarget;
-HRESULT panelMaterialResult = E_PENDING, capsuleMaterialResult = E_PENDING;
+HWND pet, panel;
+HRESULT panelMaterialResult = E_PENDING;
+struct NoticeSurface {
+  HWND window = nullptr;
+  NoticeRecord record;
+  ComPtr<ID2D1HwndRenderTarget> target;
+  HRESULT material = E_PENDING;
+  float scale = 1;
+  POINT destination{};
+  ULONGLONG hoverUntil = 0;
+  std::optional<Session> pressed;
+  bool closing = false;
+};
+std::vector<std::unique_ptr<NoticeSurface>> notices;
+NoticeSurface *FindNotice(HWND window) {
+  for (auto &notice : notices)
+    if (notice->window == window)
+      return notice.get();
+  return nullptr;
+}
+std::wstring NoticeCaption(const NoticeRecord &record) {
+  return (record.Attention() ? L"等待回答 · " : L"已完成 · ") + record.Title();
+}
 HoverPolicy hover;
-std::deque<Session> completionQueue;
-std::wstring capsuleTitle, capsuleRecap;
-std::optional<Session> capsuleSession, panelPressed, noticePressed;
+std::deque<Session> incomingNotices;
+std::optional<Session> panelPressed;
 std::wstring panelHotKey;
-bool capsuleAttention = false;
 StateClock stateClock;
 StateMotion stateMotion;
-ULONGLONG capsuleHoverUntil = 0, celebrateUntil = 0, pausedUntil = 0;
-POINT panelDestination{}, capsuleDestination{};
+ULONGLONG pausedUntil = 0;
+CompletionCelebrations celebrations;
+POINT panelDestination{};
 bool demo = false, preview = false, panelPinned = false;
 bool navigationPreview = false;
 int64_t appStartedAt = 0;
@@ -64,13 +84,11 @@ float PanelHeight() { return VisibleRows() * RowHeight; }
 std::mutex dataMutex;
 Snapshot pending;
 std::atomic_bool quitting = false;
-float dpi = 1, capsuleDpi = 1, petSize = 128, panelZoom = 1.15f;
-float CapsuleWidth() { return capsuleRecap.empty() ? 320.f : 420.f; }
-float NoticeFontSize() { return SessionTextSize * panelZoom; }
-float NoticeLineHeight() { return 17.f * panelZoom; }
-float CapsuleHeight() {
-  const float lines = capsuleRecap.empty() ? 1.f : 2.f;
-  return std::max(20.f, NoticeLineHeight() * lines) + 16.f;
+float dpi = 1, petSize = 128, panelZoom = 1.15f;
+float NoticeFontSize() { return SessionTextSize; }
+float NoticeLineHeight() { return 17.f; }
+float NoticeHeight(const NoticeSurface &notice) {
+  return RowHeight + (notice.record.Attention() ? NoticeLineHeight() : 0);
 }
 fs::path preferencesPath;
 int scroll = 0;
@@ -118,8 +136,10 @@ void SavePreferences() {
       preferencesPath.c_str());
 }
 void ReflowPopups();
+LRESULT CALLBACK CapsuleProc(HWND,UINT,WPARAM,LPARAM);
 constexpr UINT Refresh = WM_APP + 1, Tray = WM_APP + 2,
-               NavigationCompleted = WM_APP + 30, NavigationQuery = WM_APP + 31;
+               NavigationCompleted = WM_APP + 30, NavigationQuery = WM_APP + 31,
+               NoticeInfoQuery=WM_APP+32;
 
 void NavigationFeedback(NavigationCode code) {
   NOTIFYICONDATAW icon{sizeof(icon)};
@@ -195,14 +215,17 @@ void UpdatePanelFeedback() {
     SetInteractionFeedback(panel, next, {true, down}, down ? .30f : .16f);
   }
 }
-void UpdateNoticeFeedback() {
+void UpdateNoticeFeedback(HWND window) {
+  auto notice = FindNotice(window);
+  if (!notice)
+    return;
   POINT point;
   GetCursorPos(&point);
-  const bool hot =
-      PopupTargetVisible(capsule) && WindowFromPoint(point) == capsule;
-  const bool down = hot && noticePressed && capsuleSession &&
-                    SameSession(*noticePressed, *capsuleSession);
-  SetInteractionFeedback(capsule, L"body", {hot, down},
+  const bool hot = !notice->closing && PopupTargetVisible(window) &&
+                   WindowFromPoint(point) == window;
+  const bool down = hot && notice->pressed &&
+                    SameSession(*notice->pressed, notice->record.event);
+  SetInteractionFeedback(window, L"body", {hot, down},
                          down  ? .28f
                          : hot ? .14f
                                : 0);
@@ -576,8 +599,8 @@ HRESULT ApplySurfaceMaterial(HWND surface) {
                                      &material, sizeof(material));
   if (surface == panel)
     panelMaterialResult = hr;
-  if (surface == capsule)
-    capsuleMaterialResult = hr;
+  if (auto notice=FindNotice(surface))
+    notice->material=hr;
   DWM_WINDOW_CORNER_PREFERENCE corners = DWMWCP_ROUND;
   DwmSetWindowAttribute(surface, DWMWA_WINDOW_CORNER_PREFERENCE, &corners,
                         sizeof(corners));
@@ -630,7 +653,7 @@ void PaintPanel() {
                            brush.Get(), .9f);
         }
         const float hop = stateMotion.Offset(session, animationNow);
-        DrawIndicator(StateOf(session, snapshot.online), 18, y + 17 + hop,
+        DrawIndicator(StateOf(session, snapshot.online), RowIndicatorCenter, y + 17 + hop,
                       brush.Get());
         const auto state = StateOf(session, snapshot.online);
         auto tone = StateTone(state);
@@ -744,19 +767,23 @@ void DismissPanel() {
 }
 std::vector<RECT> FloatingObstacles(bool includePanel, bool includeNotice) {
   std::vector<RECT> result;
-  for (HWND window : {pet, includePanel ? panel : nullptr,
-                      includeNotice ? capsule : nullptr}) {
+  for (HWND window : {pet, includePanel ? panel : nullptr}) {
     RECT bounds;
     if (!window || !IsWindowVisible(window) || !GetWindowRect(window, &bounds))
       continue;
     bounds = PopupAnimationBounds(window);
-    if (window == capsule) {
-      const auto protrusion = (LONG)std::ceil(12 * capsuleDpi);
-      bounds.left -= protrusion;
-      bounds.top -= protrusion;
-    }
     result.push_back(bounds);
   }
+  if (includeNotice)
+    for (const auto &notice : notices) {
+      if (!IsWindowVisible(notice->window))
+        continue;
+      auto bounds = PopupAnimationBounds(notice->window);
+      const auto protrusion = (LONG)std::ceil(12 * notice->scale);
+      bounds.left -= protrusion;
+      bounds.top -= protrusion;
+      result.push_back(bounds);
+    }
   return result;
 }
 std::vector<RECT> ToolbarObstacles() { return FloatingObstacles(true, true); }
@@ -766,40 +793,87 @@ void PlaceFloating(HWND window, float logicalWidth, float logicalHeight,
   GetWindowRect(pet, &r);
   MONITORINFO mi{sizeof(mi)};
   GetMonitorInfoW(MonitorFromWindow(pet, MONITOR_DEFAULTTONEAREST), &mi);
-  const float scale = window == capsule ? capsuleDpi : dpi;
+  const float scale = dpi;
   const int edge = FloatingScreenPadding(GetDpiForWindow(pet) / 96.f);
   int w = (int)(logicalWidth * scale), h = (int)(logicalHeight * scale);
-  w = std::min<int>(w, std::max(1L, mi.rcWork.right - mi.rcWork.left - 2 * edge));
-  h = std::min<int>(h, std::max(1L, mi.rcWork.bottom - mi.rcWork.top - 2 * edge));
-  int x =
-      std::clamp<int>(r.left + (r.right - r.left - w) / 2,
-                        mi.rcWork.left + edge, mi.rcWork.right - w - edge);
+  w = std::min<int>(w,
+                    std::max(1L, mi.rcWork.right - mi.rcWork.left - 2 * edge));
+  h = std::min<int>(h,
+                    std::max(1L, mi.rcWork.bottom - mi.rcWork.top - 2 * edge));
+  int x = std::clamp<int>(r.left + (r.right - r.left - w) / 2,
+                          mi.rcWork.left + edge, mi.rcWork.right - w - edge);
   int y = r.top - h - gap;
   if (y < mi.rcWork.top + edge)
     y = r.bottom + gap;
   y = std::clamp<int>(y, mi.rcWork.top + edge, mi.rcWork.bottom - h - edge);
-  const LONG outset = window == capsule ? (LONG)std::ceil(12 * scale) : 0;
   destination = PlaceAvoidingWindows(
-      {x, y}, {w, h}, mi.rcWork, FloatingObstacles(window == capsule, false),
-      edge, (LONG)std::ceil(8 * GetDpiForWindow(pet) / 96.f), {outset, outset});
+      {x, y}, {w, h}, mi.rcWork, FloatingObstacles(false, false), edge,
+      (LONG)std::ceil(8 * GetDpiForWindow(pet) / 96.f));
   PlacePopup(window, destination, {w, h});
+}
+void PlaceNoticeWindows(bool snap = false) {
+  if (!pet)
+    return;
+  const float scale = GetDpiForWindow(pet) / 96.f;
+  const int edge = FloatingScreenPadding(scale),
+            gap = (int)std::ceil(8 * scale);
+  MONITORINFO monitor{sizeof(monitor)};
+  GetMonitorInfoW(MonitorFromWindow(pet, MONITOR_DEFAULTTONEAREST), &monitor);
+  RECT character;
+  GetWindowRect(pet, &character);
+  const auto panelBounds =
+      IsWindowVisible(panel) ? PopupAnimationBounds(panel) : character;
+  auto occupied = FloatingObstacles(true, false);
+  for (const auto &notice : notices)
+    if (notice->closing && IsWindowVisible(notice->window)) {
+      auto bounds = PopupAnimationBounds(notice->window);
+      occupied.push_back(bounds);
+    }
+  for (auto &notice : notices) {
+    if (notice->closing)
+      continue;
+    if (notice->scale != scale)
+      notice->target.Reset();
+    notice->scale = scale;
+    const float contentScale = scale * panelZoom;
+    const int width = std::min(
+        IsWindowVisible(panel) ? (int)(panelBounds.right - panelBounds.left)
+                               : (int)(PanelWidth * contentScale),
+        (int)(monitor.rcWork.right - monitor.rcWork.left) - 2 * edge);
+    const int height =
+        std::min((int)(NoticeHeight(*notice) * contentScale),
+                 (int)(monitor.rcWork.bottom - monitor.rcWork.top) - 2 * edge);
+    const POINT preferred{
+        IsWindowVisible(panel)
+            ? panelBounds.left
+            : character.left + (character.right - character.left - width) / 2,
+        std::min(character.top, panelBounds.top) - height - gap};
+    const auto outset = (LONG)std::ceil(12 * scale);
+    notice->destination =
+        PlaceAvoidingWindows(preferred, {width, height}, monitor.rcWork,
+                             occupied, edge, gap, {outset, outset});
+    PlacePopup(notice->window, notice->destination, {width, height});
+    if (snap)
+      SnapPopupPlacement(notice->window);
+    auto bounds = PopupAnimationBounds(notice->window);
+    // 同列主体之间共享 8 DIP 间距。外伸关闭钮只用于屏幕/工具栏避让，
+    // 不能把它的整块包围盒和静态动画余量重复累加到每条气泡之间。
+    occupied.push_back(bounds);
+    InvalidateRect(notice->window, nullptr, FALSE);
+  }
 }
 void ReflowPopups() {
   if (!pet)
     return;
   dpi = GetDpiForWindow(pet) / 96.f * panelZoom;
-  capsuleDpi = GetDpiForWindow(pet) / 96.f;
   target.Reset();
-  capsuleTarget.Reset();
+  for (auto &notice : notices)
+    notice->target.Reset();
   if (PopupTargetVisible(panel)) {
     PlaceFloating(panel, PanelWidth, PanelHeight(), panelDestination, 6);
     InvalidateRect(panel, nullptr, FALSE);
   }
-  if (PopupTargetVisible(capsule)) {
-    PlaceFloating(capsule, CapsuleWidth(), CapsuleHeight(), capsuleDestination,
-                  IsWindowVisible(panel) ? (int)(PanelHeight() * dpi) + 16 : 8);
-    InvalidateRect(capsule, nullptr, FALSE);
-  }
+  PlaceNoticeWindows();
   RefreshToolbarPlacement();
 }
 void MoveAttachedPopups() {
@@ -807,11 +881,7 @@ void MoveAttachedPopups() {
     PlaceFloating(panel, PanelWidth, PanelHeight(), panelDestination, 6);
     SnapPopupPlacement(panel);
   }
-  if (PopupTargetVisible(capsule)) {
-    PlaceFloating(capsule, CapsuleWidth(), CapsuleHeight(), capsuleDestination,
-                  IsWindowVisible(panel) ? (int)(PanelHeight() * dpi) + 16 : 8);
-    SnapPopupPlacement(capsule);
-  }
+  PlaceNoticeWindows(true);
   RefreshToolbarPlacement();
 }
 void ShowPanel() {
@@ -829,9 +899,7 @@ void ShowPanel() {
   hover.shown = true;
   ShowPopupAnimated(panel, panelDestination, GetDpiForWindow(pet) / 96.f);
   InvalidateRect(panel, nullptr, FALSE);
-  if (PopupTargetVisible(capsule))
-    PlaceFloating(capsule, CapsuleWidth(), CapsuleHeight(), capsuleDestination,
-                  (int)(PanelHeight() * dpi) + 16);
+  PlaceNoticeWindows();
   RefreshToolbarPlacement();
 }
 void TogglePanel() {
@@ -842,43 +910,100 @@ void TogglePanel() {
 }
 void UpdateAnimation() {
   const auto now = GetTickCount64();
+  if (celebrations.Advance(now) && animationName == L"success")
+    animationName.clear();
   bool running = snapshot.online &&
                  std::any_of(snapshot.sessions.begin(), snapshot.sessions.end(),
                              [](const auto &s) { return s.running; });
   SetAnimation(
-      SelectPetAnimation(running, now < celebrateUntil, now < pausedUntil,
+      SelectPetAnimation(running, celebrations.Active(now), now < pausedUntil,
                          hover.wasInside, dragging,
                          std::any_of(
                              snapshot.sessions.begin(), snapshot.sessions.end(),
                              [](const auto &s) { return s.waiting; })));
 }
-void ShowNextCompletion() {
-  if (completionQueue.empty() || IsWindowVisible(capsule))
+void ShowIncomingNotices() {
+  std::vector<HWND> added;
+  while (!incomingNotices.empty()) {
+    NoticeRecord record{std::move(incomingNotices.front())};
+    incomingNotices.pop_front();
+    if (!record.Sync(snapshot))
+      continue;
+    if (std::any_of(notices.begin(), notices.end(), [&](const auto &n) {
+          return n->record.Key() == record.Key();
+        }))
+      continue;
+    auto notice = std::make_unique<NoticeSurface>();
+    notice->record = std::move(record);
+    const DWORD style =
+        WS_EX_TOPMOST |
+        (preview ? WS_EX_APPWINDOW : WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
+    const auto caption = NoticeCaption(notice->record);
+    notice->window = CreateWindowExW(style, L"ZCodePet.Completion",
+                                     caption.c_str(), WS_POPUP, 0, 0, 320, 50,
+                                     pet, nullptr, instance, nullptr);
+    if (!notice->window)
+      continue;
+    const auto window = notice->window;
+    notices.push_back(std::move(notice));
+    InitNoticeClose(window, preview);
+    ApplySurfaceMaterial(window);
+    added.push_back(window);
+  }
+  if (!added.empty()) {
+    PlaceNoticeWindows();
+    for (const auto window : added) {
+      auto notice = FindNotice(window);
+      ShowPopupAnimated(window, notice->destination, notice->scale);
+    }
+    RefreshToolbarPlacement();
+  }
+}
+void CloseNotice(HWND window) {
+  auto notice = FindNotice(window);
+  if (!notice || notice->closing)
     return;
-  auto notice = completionQueue.front();
-  ClearInteractionFeedback(capsule);
-  noticePressed.reset();
-  capsuleSession = notice;
-  capsuleAttention = notice.waiting;
-  capsuleTitle = notice.title;
-  capsuleRecap = notice.waiting
-                     ? (notice.questionPreview.empty()
-                            ? L"需要你处理，请到 ZCode 查看待确认事项。"
-                            : L"等待你回答：" + notice.questionPreview)
-                     : notice.recap;
-  completionQueue.pop_front();
-  dpi = GetDpiForWindow(pet) / 96.f * panelZoom;
-  capsuleDpi = GetDpiForWindow(pet) / 96.f;
-  capsuleTarget.Reset();
-  PlaceFloating(capsule, CapsuleWidth(), CapsuleHeight(), capsuleDestination,
-                IsWindowVisible(panel) ? (int)(PanelHeight() * dpi) + 16 : 8);
-  ApplySurfaceMaterial(capsule);
-  capsuleHoverUntil = 0;
-  if (!capsuleAttention)
-    celebrateUntil = GetTickCount64() + 4000;
-  ShowPopupAnimated(capsule, capsuleDestination, capsuleDpi);
-  InvalidateRect(capsule, nullptr, FALSE);
-  RefreshToolbarPlacement();
+  notice->closing = true;
+  notice->pressed.reset();
+  notice->hoverUntil = 0;
+  ShowNoticeClose(window, notice->scale, false);
+  SetInteractionFeedback(window, L"body", {}, 0);
+  HidePopupAnimated(window, notice->scale);
+}
+void ReapNotices() {
+  bool removed = false;
+  for (auto i = notices.begin(); i != notices.end();) {
+    auto &notice = **i;
+    if (notice.closing && !IsWindowVisible(notice.window)) {
+      DestroyNoticeClose(notice.window);
+      ClearInteractionFeedback(notice.window);
+      UiRenderer::Forget(notice.window);
+      ForgetPopupAnimation(notice.window);
+      DestroyWindow(notice.window);
+      i = notices.erase(i);
+      removed = true;
+    } else
+      ++i;
+  }
+  if (removed) {
+    PlaceNoticeWindows();
+    RefreshToolbarPlacement();
+  }
+}
+void UpdateNoticeHovers() {
+  POINT p;
+  GetCursorPos(&p);
+  const auto under = WindowFromPoint(p);
+  const auto now = GetTickCount64();
+  for (auto &notice : notices) {
+    const bool visible = !notice->closing && PopupTargetVisible(notice->window);
+    if (visible &&
+        (under == notice->window || IsNoticeClose(notice->window, under)))
+      notice->hoverUntil = now + 160;
+    ShowNoticeClose(notice->window, notice->scale,
+                    visible && now < notice->hoverUntil);
+    UpdateNoticeFeedback(notice->window);
+  }
 }
 void HoverTick() {
   SetFrameClockMonitor(MonitorFromWindow(pet, MONITOR_DEFAULTTONEAREST));
@@ -895,14 +1020,10 @@ void HoverTick() {
     ShowPanel();
   if (!show && PopupTargetVisible(panel))
     HidePopupAnimated(panel, GetDpiForWindow(pet) / 96.f);
-  auto now = GetTickCount64();
-  ShowNextCompletion();
-  const bool noticeVisible = PopupTargetVisible(capsule);
-  if (noticeVisible && (under == capsule || IsNoticeClose(under)))
-    capsuleHoverUntil = now + 160;
-  ShowNoticeClose(capsuleDpi, noticeVisible && now < capsuleHoverUntil);
+  ReapNotices();
+  ShowIncomingNotices();
+  UpdateNoticeHovers();
   UpdatePanelFeedback();
-  UpdateNoticeFeedback();
   UpdateAnimation();
 }
 void TickPanel() {
@@ -934,47 +1055,59 @@ void TickPanel() {
   previousAges = std::move(ages);
   wasTransitioning = transitioning;
 }
-void PaintCapsule() {
+void PaintCapsule(HWND window) {
+  auto notice = FindNotice(window);
+  if (!notice)
+    return;
+  const bool capsuleAttention = notice->record.Attention();
+  const auto capsuleTitle = notice->record.Title(),
+             capsuleRecap = notice->record.Detail();
   const auto savedDpi = dpi;
-  dpi = capsuleDpi;
+  dpi = notice->scale * panelZoom;
   auto saved = target;
-  target = capsuleTarget;
+  target = notice->target;
   PAINTSTRUCT ps;
-  BeginPaint(capsule, &ps);
+  BeginPaint(window, &ps);
   RECT rc;
-  GetClientRect(capsule, &rc);
+  GetClientRect(window, &rc);
   if (!target) {
-    UiRenderer::Create(factory.Get(), capsule, 96 * dpi,
-                         D2D1::SizeU(rc.right, rc.bottom), &target);
+    UiRenderer::Create(factory.Get(), window, 96 * dpi,
+                       D2D1::SizeU(rc.right, rc.bottom), &target);
   }
   if (target) {
     target->BeginDraw();
     const float width = rc.right / dpi, height = rc.bottom / dpi;
     PetTheme::PaintSurface(target.Get(), width, height,
-                           SUCCEEDED(capsuleMaterialResult),8.f,false);
-    PetTheme::PaintFeedback(target.Get(),
-                           D2D1::RectF(0,0,width,height),
-                           InteractionOpacity(capsule, L"body"),0);
+                           SUCCEEDED(notice->material), 8.f, false);
+    PetTheme::PaintFeedback(target.Get(), D2D1::RectF(0, 0, width, height),
+                            InteractionOpacity(window, L"body"), 0);
     const float badgeY = height / 2;
+    const float badgeX = RowIndicatorCenter, glyphScale = 1.f / panelZoom;
     ComPtr<ID2D1SolidColorBrush> green;
     const auto tone = StateTone(capsuleAttention ? SessionState::Waiting
-                                                : SessionState::Completed);
-    target->CreateSolidColorBrush(
-        D2D1::ColorF(tone.fill),
-        &green);
-    target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(20, badgeY), 10, 10),
+                                                 : SessionState::Completed);
+    target->CreateSolidColorBrush(D2D1::ColorF(tone.fill), &green);
+    target->FillEllipse(D2D1::Ellipse(D2D1::Point2F(badgeX, badgeY),
+                                      10 * glyphScale, 10 * glyphScale),
                         green.Get());
     green->SetColor(D2D1::ColorF(tone.ink));
     if (capsuleAttention) {
-      target->DrawLine(D2D1::Point2F(20, badgeY - 4),
-                       D2D1::Point2F(20, badgeY + 1), green.Get(), 2.f);
+      target->DrawLine(D2D1::Point2F(badgeX, badgeY - 4 * glyphScale),
+                       D2D1::Point2F(badgeX, badgeY + glyphScale), green.Get(),
+                       2.f * glyphScale);
       target->FillEllipse(
-          D2D1::Ellipse(D2D1::Point2F(20, badgeY + 4.5f), 1.f, 1.f), green.Get());
+          D2D1::Ellipse(D2D1::Point2F(badgeX, badgeY + 4.5f * glyphScale),
+                        glyphScale, glyphScale),
+          green.Get());
     } else {
-      target->DrawLine(D2D1::Point2F(15, badgeY),
-                       D2D1::Point2F(18.5f, badgeY + 3.3f), green.Get(), 2.f);
-      target->DrawLine(D2D1::Point2F(18.5f, badgeY + 3.3f),
-                       D2D1::Point2F(25, badgeY - 4), green.Get(), 2.f);
+      target->DrawLine(
+          D2D1::Point2F(badgeX - 5 * glyphScale, badgeY),
+          D2D1::Point2F(badgeX - 1.5f * glyphScale, badgeY + 3.3f * glyphScale),
+          green.Get(), 2.f * glyphScale);
+      target->DrawLine(
+          D2D1::Point2F(badgeX - 1.5f * glyphScale, badgeY + 3.3f * glyphScale),
+          D2D1::Point2F(badgeX + 5 * glyphScale, badgeY - 4 * glyphScale),
+          green.Get(), 2.f * glyphScale);
     }
     std::wstring title = capsuleTitle.empty() ? L"未命名会话" : capsuleTitle;
     if (title.size() > 44) {
@@ -983,29 +1116,31 @@ void PaintCapsule() {
         title.pop_back();
       title += L"…";
     }
-    const auto content = title + (capsuleRecap.empty()
-                                     ? capsuleAttention ? L" · 请求回答" : L" · 已完成"
-                                     : L" · " + capsuleRecap);
+    const auto content =
+        title + (capsuleRecap.empty()
+                     ? capsuleAttention ? L" · 请求回答" : L" · 已完成"
+                     : L" · " + capsuleRecap);
     ComPtr<IDWriteTextFormat> format;
     writeFactory->CreateTextFormat(
         L"Segoe UI Variable", nullptr, DWRITE_FONT_WEIGHT_NORMAL,
-        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, NoticeFontSize(), L"zh-CN",
-        &format);
+        DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, NoticeFontSize(),
+        L"zh-CN", &format);
     if (format) {
       format->SetWordWrapping(capsuleRecap.empty()
                                   ? DWRITE_WORD_WRAPPING_NO_WRAP
                                   : DWRITE_WORD_WRAPPING_WRAP);
       format->SetLineSpacing(DWRITE_LINE_SPACING_METHOD_UNIFORM,
-                              NoticeLineHeight(), 13.5f * panelZoom);
+                             NoticeLineHeight(), 13.5f);
       DWRITE_TRIMMING trim{DWRITE_TRIMMING_GRANULARITY_CHARACTER, 0, 0};
       ComPtr<IDWriteInlineObject> sign;
       writeFactory->CreateEllipsisTrimmingSign(format.Get(), &sign);
       format->SetTrimming(&trim, sign.Get());
-      const float textHeight = NoticeLineHeight() * (capsuleRecap.empty() ? 1 : 2);
+      const float textHeight =
+          NoticeLineHeight() * (capsuleRecap.empty() ? 1 : 2);
       ComPtr<IDWriteTextLayout> layout;
-      writeFactory->CreateTextLayout(content.c_str(), (UINT32)content.size(),
-                                     format.Get(), width - 48, textHeight,
-                                     &layout);
+      writeFactory->CreateTextLayout(
+          content.c_str(), (UINT32)content.size(), format.Get(),
+          width - RowTitleLeft - RowSidePadding, textHeight, &layout);
       if (layout) {
         layout->SetFontWeight(DWRITE_FONT_WEIGHT_SEMI_BOLD,
                               DWRITE_TEXT_RANGE{0, (UINT32)title.size()});
@@ -1014,37 +1149,52 @@ void PaintCapsule() {
         target->CreateSolidColorBrush(D2D1::ColorF(PetTheme::Ink), &heading);
         layout->SetDrawingEffect(heading.Get(),
                                  DWRITE_TEXT_RANGE{0, (UINT32)title.size()});
-        const float y = CenteredTextOriginY(factory.Get(), layout.Get(), height);
+        const float y =
+            CenteredTextOriginY(factory.Get(), layout.Get(), height);
         const float clipY = (height - textHeight) / 2;
-        target->PushAxisAlignedClip(
-            D2D1::RectF(36, clipY, width - 12, clipY + textHeight),
-            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        target->PushAxisAlignedClip(D2D1::RectF(RowTitleLeft, clipY,
+                                                width - RowSidePadding,
+                                                clipY + textHeight),
+                                    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
         if (experimental) {
-          auto renderer =
-              new CoverageRenderer(target.Get(), D2D1::ColorF(PetTheme::Muted), dpi);
-          layout->Draw(nullptr, renderer, 36, y);
+          auto renderer = new CoverageRenderer(
+              target.Get(), D2D1::ColorF(PetTheme::Muted), dpi);
+          layout->Draw(nullptr, renderer, RowTitleLeft, y);
           renderer->Release();
         } else {
           target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-          target->DrawTextLayout(D2D1::Point2F(36, y), layout.Get(), body.Get(),
-                                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
+          target->DrawTextLayout(D2D1::Point2F(RowTitleLeft, y), layout.Get(),
+                                 body.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
         target->PopAxisAlignedClip();
       }
     }
-    PetTheme::PaintSurfaceBorder(target.Get(),width,height);
+    PetTheme::PaintSurfaceBorder(target.Get(), width, height);
     if (target->EndDraw() == D2DERR_RECREATE_TARGET)
       target.Reset();
   }
-  EndPaint(capsule, &ps);
-  capsuleTarget = target;
+  EndPaint(window, &ps);
+  notice->target = target;
   target = saved;
   dpi = savedDpi;
 }
 LRESULT CALLBACK CapsuleProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+  auto notice = FindNotice(h);
+  if (!notice)
+    return DefWindowProcW(h, msg, w, l);
   switch (msg) {
   case PopupBackendQuery:
-    return capsuleTarget ? UiRenderer::Backend(h) : -1;
+    if (w == 1 && notice->target) {
+      float x, y;
+      notice->target->GetDpi(&x, &y);
+      return (LRESULT)std::lround(x * 100);
+    }
+    return notice->target ? UiRenderer::Backend(h) : -1;
+  case WM_SIZE:
+    if (notice->target)
+      notice->target->Resize(D2D1::SizeU(LOWORD(l), HIWORD(l)));
+    InvalidateRect(h, nullptr, FALSE);
+    return 0;
   case WM_NCACTIVATE:
     // Win32 默认非激活处理会把背景亚克力退成实色；保持视觉活跃，不改变焦点。
     return DefWindowProcW(h, WM_NCACTIVATE, TRUE, l);
@@ -1058,7 +1208,7 @@ LRESULT CALLBACK CapsuleProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   case WM_ERASEBKGND:
     return 1;
   case WM_PAINT:
-    PaintCapsule();
+    PaintCapsule(h);
     return 0;
   case WM_SETCURSOR:
     if (LOWORD(l) == HTCLIENT) {
@@ -1067,45 +1217,45 @@ LRESULT CALLBACK CapsuleProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     }
     break;
   case WM_LBUTTONDOWN:
-    noticePressed = capsuleSession;
+    if (notice->closing)
+      return 0;
+    notice->pressed = notice->record.event;
     SetCapture(h);
-    UpdateNoticeFeedback();
+    UpdateNoticeFeedback(h);
     return 0;
   case WM_LBUTTONUP: {
-    auto pressed = noticePressed;
-    noticePressed.reset();
+    auto pressed = notice->pressed;
+    notice->pressed.reset();
     if (GetCapture() == h)
       ReleaseCapture();
-    UpdateNoticeFeedback();
+    UpdateNoticeFeedback(h);
     RECT bounds;
     GetClientRect(h, &bounds);
     POINT point{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
-    if (pressed && capsuleSession && SameSession(*pressed, *capsuleSession) &&
-        PtInRect(&bounds, point) && PopupTargetVisible(h))
+    if (pressed && SameSession(*pressed, notice->record.event) &&
+        PtInRect(&bounds, point) && !notice->closing && PopupTargetVisible(h))
       OpenSession(*pressed);
     return 0;
   }
   case WM_CAPTURECHANGED:
-    noticePressed.reset();
-    UpdateNoticeFeedback();
+    notice->pressed.reset();
+    UpdateNoticeFeedback(h);
     return 0;
   case WM_MOUSEMOVE: {
     TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, h, 0};
     TrackMouseEvent(&track);
-    UpdateNoticeFeedback();
+    UpdateNoticeFeedback(h);
     return 0;
   }
   case WM_MOUSELEAVE:
-    SetInteractionFeedback(h,L"body",{},0);
+    SetInteractionFeedback(h, L"body", {}, 0);
     return 0;
   case WM_CLOSE:
-    ShowNoticeClose(capsuleDpi, false);
-    capsuleHoverUntil = 0;
-    HidePopupAnimated(h, capsuleDpi);
+    CloseNotice(h);
     return 0;
   case WM_DPICHANGED:
-    capsuleDpi = HIWORD(w) / 96.f;
-    capsuleTarget.Reset();
+    notice->scale = HIWORD(w) / 96.f;
+    notice->target.Reset();
     return 0;
   }
   return DefWindowProcW(h, msg, w, l);
@@ -1165,6 +1315,7 @@ void Menu() { ShowToolbar(); }
 LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   switch (msg) {
   case PopupBackendQuery:
+    if (w==1 && target) { float x,y; target->GetDpi(&x,&y); return (LRESULT)std::lround(x*100); }
     return target ? UiRenderer::Backend(h) : -1;
   case WM_TIMER:
     if (w == 3)
@@ -1261,6 +1412,25 @@ LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 }
 LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   switch (msg) {
+  case NoticeInfoQuery: {
+    if (w == 5)
+      return (LRESULT)celebrations.pending;
+    if (w == 6)
+      return animationName == L"success"   ? 2
+             : animationName == L"working" ? 1
+             : animationName == L"waiting" ? 3
+             : animationName == L"paused"  ? 4
+                                           : 0;
+    size_t totalNotices = 0;
+    for (const auto &notice : notices) {
+      if (w == 3)
+        totalNotices += notice->closing;
+      else if (!notice->closing && IsWindowVisible(notice->window))
+        totalNotices += w == 0 || (w == 1 && !notice->record.Attention()) ||
+                        (w == 2 && notice->record.Attention());
+    }
+    return (LRESULT)totalNotices;
+  }
   case NavigationCompleted:
     if (const auto result = TakeNavigationResult())
       NavigationFeedback(result->code);
@@ -1281,8 +1451,7 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     PulseInteractionFeedback();
     if (IsWindowVisible(panel))
       UpdateWindow(panel);
-    ShowNoticeClose(capsuleDpi, PopupTargetVisible(capsule) &&
-                                   GetTickCount64() < capsuleHoverUntil);
+    UpdateNoticeHovers();
     return 0;
   case VisualFrameInfoQuery:
     if (w == 3)
@@ -1394,10 +1563,24 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     {
       std::lock_guard lock(dataMutex);
       for (auto &session : attention.Accept(pending)) {
-        completionQueue.push_back(session);
+        incomingNotices.push_back(session);
       }
-      for (auto &session : completions.Accept(pending))
-        completionQueue.push_back(session);
+      auto finished = completions.Accept(pending);
+      celebrations.Push(finished.size());
+      for (auto &session : finished)
+        incomingNotices.push_back(session);
+      for (auto &notice : notices)
+        if (!notice->closing) {
+          const auto previousTitle = notice->record.Title();
+          if (!notice->record.Sync(pending))
+            CloseNotice(notice->window);
+          else {
+            if (previousTitle != notice->record.Title())
+              SetWindowTextW(notice->window,
+                             NoticeCaption(notice->record).c_str());
+            InvalidateRect(notice->window, nullptr, FALSE);
+          }
+        }
       if (snapshot.online && pending.online)
         for (const auto &before : snapshot.sessions)
           if (before.running)
@@ -1407,16 +1590,19 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                   after.endedAt > 0 &&
                   (after.result == L"error" || after.result == L"interrupted"))
                 pausedUntil = GetTickCount64() + 4000;
-      stateMotion.Update(pending, (uint64_t)VisualClockMs(), IsWindowVisible(panel));
+      stateMotion.Update(pending, (uint64_t)VisualClockMs(),
+                         IsWindowVisible(panel));
       snapshot = std::move(pending);
       stateClock.Update(snapshot, WallClockMs());
       if (navigationPreview && !snapshot.sessions.empty()) {
         // 显式本地验收入口，只生成一条已有会话的预览提醒，不伪造 ZCode 状态。
-        auto notice = snapshot.sessions.front();
-        notice.waiting = false;
-        notice.recap =
-            L"导航预览：点击正文打开对应已有会话；关闭钮只关闭提醒。";
-        completionQueue.push_back(std::move(notice));
+        const auto ready = std::find_if(
+            snapshot.sessions.begin(), snapshot.sessions.end(),
+            [](const auto &s) {
+              return !s.running && !s.waiting && s.result == L"completed";
+            });
+        if (ready != snapshot.sessions.end())
+          incomingNotices.push_back(*ready);
         navigationPreview = false;
       }
       scroll = std::clamp(
@@ -1433,7 +1619,7 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         ReflowPopups();
       }
     }
-    ShowNextCompletion();
+    ShowIncomingNotices();
     UpdateAnimation();
     TickPanel();
     InvalidateRect(panel, nullptr, FALSE);
@@ -1458,6 +1644,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   GetModuleFileNameW(nullptr, path, 32768);
   base = fs::path(path).parent_path();
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  if (wcsstr(command,L"--notice-test")) return NoticeModelTests() ? 0 : 1;
   if (wcsstr(command, L"--interaction-motion-test"))
     return InteractionMotionTests() ? 0 : 1;
   if (wcsstr(command, L"--navigation-test")) {
@@ -1532,7 +1719,41 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
           << ((sessionBounds.left + sessionBounds.right) -
               (petBounds.left + petBounds.right)) / 2. << "\n";
     }
-    HWND notice = FindWindowW(L"ZCodePet.Completion", L"任务完成");
+    std::vector<HWND> noticeWindows;
+    for (HWND window =
+             FindWindowExW(nullptr, nullptr, L"ZCodePet.Completion", nullptr);
+         window; window = FindWindowExW(nullptr, window, L"ZCodePet.Completion",
+                                        nullptr))
+      if (IsWindowVisible(window))
+        noticeWindows.push_back(window);
+    HWND notice = noticeWindows.empty() ? nullptr : noticeWindows.front();
+    RECT panelGeometry{};
+    GetWindowRect(FindWindowW(L"ZCodePet.Sessions", L"ZCode 会话"),
+                  &panelGeometry);
+    LONG minNoticeWidth = MAXLONG, maxNoticeWidth = 0;
+    for (const auto window : noticeWindows) {
+      RECT bounds{};
+      GetWindowRect(window, &bounds);
+      minNoticeWidth = std::min(minNoticeWidth, bounds.right - bounds.left);
+      maxNoticeWidth = std::max(maxNoticeWidth, bounds.right - bounds.left);
+    }
+    f << "panelWidth=" << panelGeometry.right - panelGeometry.left
+      << " noticeMinWidth=" << (noticeWindows.empty() ? 0 : minNoticeWidth)
+      << " noticeMaxWidth=" << maxNoticeWidth << "\n";
+    std::vector<RECT> column;
+    if (IsWindowVisible(FindWindowW(L"ZCodePet.Sessions",L"ZCode 会话"))) column.push_back(panelGeometry);
+    for (const auto window:noticeWindows) { RECT bounds{}; GetWindowRect(window,&bounds); column.push_back(bounds); }
+    std::sort(column.begin(),column.end(),[](const auto &a,const auto &b){return a.top<b.top;});
+    LONG minimumGap=MAXLONG,maximumGap=0; size_t gapPairs=0;
+    for (size_t i=1;i<column.size();++i) {
+      const auto &a=column[i-1],&b=column[i];
+      if (a.left==b.left && a.right==b.right && b.top>=a.bottom) {
+        const auto value=b.top-a.bottom;
+        minimumGap=std::min(minimumGap,value); maximumGap=std::max(maximumGap,value); ++gapPairs;
+      }
+    }
+    f << "noticeGapMin=" << (gapPairs ? minimumGap : 0)
+      << " noticeGapMax=" << maximumGap << " noticeGapPairs=" << gapPairs << "\n";
     if (notice) {
       BOOL nonClient = FALSE;
       DWM_WINDOW_CORNER_PREFERENCE corners{};
@@ -1557,10 +1778,13 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
     }
     std::vector<RECT> visibleWindows;
     for (HWND window : {character, FindWindowW(L"ZCodePet.Sessions", L"ZCode 会话"),
-                        notice, FindWindowW(L"ZCodePet.Toolbar", L"桌宠工具栏")}) {
+                        FindWindowW(L"ZCodePet.Toolbar", L"桌宠工具栏")}) {
       RECT bounds;
       if (window && IsWindowVisible(window) && GetWindowRect(window, &bounds))
         visibleWindows.push_back(bounds);
+    }
+    for (const auto window:noticeWindows) {
+      RECT bounds; if (GetWindowRect(window,&bounds)) visibleWindows.push_back(bounds);
     }
     int overlaps = 0;
     for (size_t i = 0; i < visibleWindows.size(); ++i)
@@ -1579,6 +1803,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
       << " toolbarRenderer=" << backend(FindWindowW(L"ZCodePet.Toolbar", L"桌宠工具栏"))
       << " popupAverageFrameMs="
       << SendMessageW(character, PopupFrameTimeQuery, 0, 0) / 100. << "\n";
+    f << "panelRenderDpi=" << SendMessageW(FindWindowW(L"ZCodePet.Sessions",L"ZCode 会话"),PopupBackendQuery,1,0)/100.
+      << " noticeRenderDpi=" << SendMessageW(notice,PopupBackendQuery,1,0)/100. << "\n";
     f << "displayHz=" << SendMessageW(character, VisualFrameInfoQuery, 0, 0)
       << " vblankClock=" << SendMessageW(character, VisualFrameInfoQuery, 1, 0)
       << " visualFrameAverageMs="
@@ -1599,6 +1825,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
       << SendMessageW(character, NavigationQuery, 7, 0)
       << " navigationProjectType="
       << SendMessageW(character, NavigationQuery, 8, 0) << "\n";
+    f << "noticesVisible=" << SendMessageW(character, NoticeInfoQuery, 0, 0)
+      << " completedNotices=" << SendMessageW(character, NoticeInfoQuery, 1, 0)
+      << " waitingNotices=" << SendMessageW(character, NoticeInfoQuery, 2, 0)
+      << " closingNotices=" << SendMessageW(character, NoticeInfoQuery, 3, 0)
+      << " celebrationsPending="
+      << SendMessageW(character, NoticeInfoQuery, 5, 0)
+      << " petAnimation=" << SendMessageW(character, NoticeInfoQuery, 6, 0)
+      << "\n";
     return s.error.empty() ? 0 : 2;
   }
   if (wcsstr(command, L"--quit")) {
@@ -1663,13 +1897,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   panel = CreateWindowExW(popupStyle & ~WS_EX_NOACTIVATE, L"ZCodePet.Sessions",
                           L"ZCode 会话", WS_POPUP, 0, 0, 288, 250, pet, nullptr,
                           inst, nullptr);
-  capsule =
-      CreateWindowExW(preview ? popupStyle & ~WS_EX_NOACTIVATE : popupStyle,
-                      L"ZCodePet.Completion", L"任务完成", WS_POPUP,
-                      0, 0, 260, 62, pet, nullptr, inst, nullptr);
-  InitNoticeClose(capsule, preview);
-  for (HWND surface : {panel, capsule})
-    ApplySurfaceMaterial(surface);
+  ApplySurfaceMaterial(panel);
   InitToolbar(pet, factory.Get(), writeFactory.Get(), ToolbarValues,
               ExecuteToolbarAction, ApplySurfaceMaterial, ToolbarObstacles, preview);
   NOTIFYICONDATAW n{sizeof(n)};
@@ -1694,18 +1922,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   StartSessionNavigation(pet,NavigationCompleted);
   std::thread worker([] {
     auto demoStart = GetTickCount64();
-    std::map<std::wstring, std::wstring> recapCache;
     while (!quitting) {
       Snapshot s;
       try {
         if (demo) {
           s.online = true;
+          const auto demoAge = GetTickCount64() - demoStart;
           Session a;
           a.id = L"demo";
           a.workspace = L"demo";
-          a.title = L"桌宠状态提示更新";
-          a.recap = L"提醒采用原生圆角和系统阴影，文字与会话面板同步；悬停"
-                    L"左上角可手动关闭。";
+          a.title =
+              demoAge < 14000 ? L"桌宠状态提示更新" : L"已重命名的外观会话";
           a.path = L"ZCode Pet";
           a.startedAt = appStartedAt;
           a.running = GetTickCount64() - demoStart < 8000;
@@ -1723,14 +1950,38 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
               demoEnded = a.endedAt;
             a.endedAt = demoEnded;
           }
-          s.sessions = {a};
+          if (demoAge >= 18000) {
+            a.running = true;
+            a.turnId = L"demo-two";
+            a.startedAt = appStartedAt + 18000;
+            a.endedAt = 0;
+            a.result.clear();
+          }
+          Session second;
+          second.id = L"demo-second";
+          second.workspace = L"demo";
+          second.title = L"第二个会话完成";
+          second.turnId = L"demo-second-one";
+          second.startedAt = appStartedAt;
+          second.running = demoAge < 10000;
+          if (!second.running) {
+            second.endedAt = appStartedAt + 10000;
+            second.result = L"completed";
+          }
+          Session active;
+          active.id = L"demo-active";
+          active.workspace = L"demo";
+          active.title = L"持续工作的会话";
+          active.turnId = L"demo-active-one";
+          active.startedAt = appStartedAt;
+          active.running = true;
+          s.sessions = {a, second, active};
           // Fixed local fixtures make every semantic palette inspectable by
           // scrolling, without manufacturing events in the observed app.
           Session waiting;
           waiting.id = L"demo-waiting";
           waiting.turnId = L"demo-question";
           waiting.title = L"chat 等待你的回答";
-          const auto demoAge = GetTickCount64() - demoStart;
           waiting.waiting = demoAge < 20000;
           waiting.running = !waiting.waiting;
           waiting.resumedAt = appStartedAt + 20000;
@@ -1761,16 +2012,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
                             {waiting, completed, error, interrupted, unknown});
         } else {
           s = Observe();
-          for (auto &session : s.sessions)
-            if (session.result == L"completed" &&
-                session.endedAt > appStartedAt && !session.turnId.empty()) {
-              auto key = session.workspace + L"\n" + session.id + L"\n" +
-                         session.turnId;
-              auto i = recapCache.find(key);
-              if (i == recapCache.end())
-                i = recapCache.emplace(key, ReadFinalRecap(session)).first;
-              session.recap = i->second;
-            }
         }
       } catch (...) {
         s.error = L"状态读取失败";
@@ -1798,9 +2039,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   DestroyToolbar();
   ClearPopupAnimations();
   ClearAllInteractionFeedback();
-  DestroyNoticeClose();
-  DestroyWindow(capsule);
-  capsuleTarget.Reset();
+  for (auto &notice:notices) {
+    DestroyNoticeClose(notice->window);
+    UiRenderer::Forget(notice->window);
+    DestroyWindow(notice->window);
+  }
+  notices.clear();
   DestroyWindow(panel);
   animation.reset();
   petCanvas.Reset();

@@ -61,6 +61,7 @@ void HidePopupImmediately(HWND window);
 bool PopupTargetVisible(HWND window);
 RECT PopupAnimationBounds(HWND window);
 void ClearPopupAnimations();
+void ForgetPopupAnimation(HWND window);
 void PulsePopupAnimations();
 double PopupAverageFrameMs();
 

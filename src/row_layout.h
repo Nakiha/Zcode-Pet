@@ -1,9 +1,11 @@
 #pragma once
 #include <algorithm>
 inline constexpr float RowSidePadding = 10;
+inline constexpr float RowTitleLeft = 34, RowIndicatorCenter = 18;
 struct RowLayout {
-  float titleLeft = 34, titleRight = 34, timeLeft = 34, timeRight = 34,
-        badgeLeft = 34, badgeRight = 34;
+  float titleLeft = RowTitleLeft, titleRight = RowTitleLeft,
+        timeLeft = RowTitleLeft, timeRight = RowTitleLeft,
+        badgeLeft = RowTitleLeft, badgeRight = RowTitleLeft;
 };
 inline RowLayout LayoutRow(float width, float timeWidth, float stateWidth) {
   RowLayout r;
