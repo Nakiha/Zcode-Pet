@@ -98,6 +98,11 @@ try {
       PanelPaintsPerSecond=($after.panelDraws-$before.panelDraws)/$renderElapsed;
       PetUploadsPerSecond=($after.petDraws-$before.petDraws)/$renderElapsed;
       VisualFramesPerSecond=($after.visualFrames-$before.visualFrames)/$renderElapsed;
+      StaticRebuildsPerSecond=($after.panelCacheBuilds-$before.panelCacheBuilds)/$renderElapsed;
+      CacheHitsPerSecond=($after.panelCacheHits-$before.panelCacheHits)/$renderElapsed;
+      CacheFallbacks=($after.panelCacheFallbacks-$before.panelCacheFallbacks);
+      BackdropMode=$after.backdropMode; BackdropType=$after.backdropType;
+      PanelDrawErrors=$after.panelDrawErrors-$before.panelDrawErrors;
       DedicatedMiB=($memory | Measure-Object DedicatedUsage -Sum).Sum/1MB;
       SharedMiB=($memory | Measure-Object SharedUsage -Sum).Sum/1MB;
       BoardUtilizationPercent=[double]$hardware[0]; BoardPowerWatts=[double]$hardware[1]; BoardGraphicsClockMHz=[double]$hardware[2];

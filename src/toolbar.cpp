@@ -51,9 +51,13 @@ std::vector<Item> Items() {
             {5, L"子像素强度 50%"},
             {6, L"子像素强度 75%"},
             {7, L"子像素强度 100%"}};
+  if (page == 4)
+    return {{1000, L"返回"}, {30, L"实时亚克力 · 模糊后方窗口"},
+            {31, L"壁纸云母 · 仅使用桌面壁纸"}, {32, L"纯色 · 关闭背景材质"}};
   return {{1, L"显示或收起会话"}, {15, L"固定会话面板"},
           {100, L"宠物大小"},     {101, L"面板大小"},
-          {102, L"文字显示"},     {14, L"恢复所有默认大小"},
+          {102, L"文字显示"},     {103, L"背景材质"},
+          {14, L"恢复所有默认大小"},
           {3, L"素材来源与许可"}, {4, L"退出桌宠"}};
 }
 float Width() { return Inset * 2 + Cell * Items().size(); }
@@ -94,6 +98,20 @@ void Icon(int id, float x, float y, ID2D1SolidColorBrush *b) {
     canvas->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x + a, y + c), r, r), b,
                         1.5f);
   };
+  if (id == 103 || (id >= 30 && id <= 32)) {
+    canvas->DrawRoundedRectangle(
+        D2D1::RoundedRect(D2D1::RectF(x-9,y-7,x+9,y+7),2,2),b,1.5f);
+    if (id == 32)
+      canvas->FillRoundedRectangle(
+          D2D1::RoundedRect(D2D1::RectF(x-5,y-3,x+5,y+3),1,1),b);
+    else if (id == 31) {
+      line(-7,5,-1,-1); line(-1,-1,2,2); line(2,2,5,-2); line(5,-2,8,2);
+      circle(-4,-3,1.1f);
+    } else {
+      line(-5,-4,-5,4); line(0,-4,0,4); line(5,-4,5,4);
+    }
+    return;
+  }
   if (id == 1) {
     for (int i = -1; i <= 1; ++i) {
       line(-4, i * 6.f, 8, i * 6.f);
@@ -222,7 +240,8 @@ void Icon(int id, float x, float y, ID2D1SolidColorBrush *b) {
         x - 18, y - 8, 36, 11, D2D1::ColorF(PetTheme::Muted), true);
 }
 bool Selected(int id, const ToolbarState &s) {
-  return (id == 15 && s.pinned) || (id == 20 && !s.subpixel) ||
+  return (id >= 30 && id <= 32 && id-30 == (int)s.backdrop) ||
+         (id == 15 && s.pinned) || (id == 20 && !s.subpixel) ||
          (id == 21 && s.subpixel) ||
          (s.subpixel && ((id == 5 && s.strength < .6f) ||
                          (id == 6 && s.strength > .6f && s.strength < .9f) ||
@@ -290,6 +309,7 @@ void Paint() {
                         : page == 1 ? L"宠物大小"
                         : page == 2 ? L"面板大小"
                         : page == 3 ? L"文字显示"
+                        : page == 4 ? L"背景材质 · " + std::wstring(BackdropName(state.backdrop))
                                     : L"会话与显示设置";
     if (page == 1)
       hint += L" · " + std::to_wstring(state.petSize);
@@ -326,8 +346,8 @@ void Activate(int index) {
   if (index < 0 || index >= (int)items.size() || !items[index].id)
     return;
   int id = items[index].id;
-  if (id == 100 || id == 101 || id == 102 || id == 1000) {
-    page = id == 100 ? 1 : id == 101 ? 2 : id == 102 ? 3 : 0;
+  if (id == 100 || id == 101 || id == 102 || id == 103 || id == 1000) {
+    page = id == 100 ? 1 : id == 101 ? 2 : id == 102 ? 3 : id == 103 ? 4 : 0;
     hovered = pressed = -1;
     focus = 0;
     ClearInteractionFeedback(window);
@@ -371,6 +391,7 @@ LRESULT CALLBACK Proc(HWND h, UINT message, WPARAM w, LPARAM l) {
   case WM_THEMECHANGED:
   case WM_DWMCOMPOSITIONCHANGED:
   case WM_SETTINGCHANGE:
+  case BackdropChanged:
     materialResult = applyMaterial(h);
     InvalidateRect(h, nullptr, FALSE);
     return 0;
@@ -482,6 +503,10 @@ void InitToolbar(HWND parent, ID2D1Factory *renderer,
                            wc.lpszClassName, L"桌宠工具栏", WS_POPUP, 0, 0, 320,
                            64, owner, nullptr, wc.hInstance, nullptr);
   materialResult = applyMaterial(window);
+}
+void RefreshToolbarMaterial() {
+  if (window)
+    SendMessageW(window, BackdropChanged, 0, 0);
 }
 void ShowToolbar() {
   if (opened) {
