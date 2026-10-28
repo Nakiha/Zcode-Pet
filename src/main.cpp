@@ -13,6 +13,7 @@
 #include "ui_renderer.h"
 #include "frame_clock.h"
 #include "pet_canvas.h"
+#include "session_navigation.h"
 #include <deque>
 #include <chrono>
 #include <cmath>
@@ -39,12 +40,14 @@ HRESULT panelMaterialResult = E_PENDING, capsuleMaterialResult = E_PENDING;
 HoverPolicy hover;
 std::deque<Session> completionQueue;
 std::wstring capsuleTitle, capsuleRecap;
+std::optional<Session> capsuleSession, panelPressed, noticePressed;
 bool capsuleAttention = false;
 StateClock stateClock;
 StateMotion stateMotion;
 ULONGLONG capsuleHoverUntil = 0, celebrateUntil = 0, pausedUntil = 0;
 POINT panelDestination{}, capsuleDestination{};
 bool demo = false, preview = false, panelPinned = false;
+bool navigationPreview = false;
 int64_t appStartedAt = 0;
 constexpr float PanelWidth = 312, RowHeight = 34, ListTop = 0,
                 SessionTextSize = 12;
@@ -113,7 +116,62 @@ void SavePreferences() {
       preferencesPath.c_str());
 }
 void ReflowPopups();
-constexpr UINT Refresh = WM_APP + 1, Tray = WM_APP + 2;
+constexpr UINT Refresh = WM_APP + 1, Tray = WM_APP + 2,
+               NavigationCompleted = WM_APP + 30, NavigationQuery = WM_APP + 31;
+
+void NavigationFeedback(NavigationCode code) {
+  NOTIFYICONDATAW icon{sizeof(icon)};
+  icon.hWnd = pet;
+  icon.uID = 1;
+  icon.uFlags = NIF_TIP;
+  wcscpy_s(icon.szTip, code == NavigationCode::Busy
+                           ? L"ZCode Pet · 正在定位会话…"
+                           : L"ZCode Pet · 只读状态观察");
+  if (code != NavigationCode::Busy && code != NavigationCode::Opened) {
+    const wchar_t *text = L"未能打开会话，请在 ZCode 中手动选择后重试。";
+    if (code == NavigationCode::Ambiguous)
+      text = L"项目或会话存在重名，无法唯一定位。请在 ZCode 中手动选择。";
+    else if (code == NavigationCode::NotVisible)
+      text = L"请先在 ZCode 侧栏展开对应项目，并让会话条目可见后重试。";
+    else if (code == NavigationCode::AppClosed ||
+             code == NavigationCode::Unavailable)
+      text = L"ZCode 未运行或会话信息不可用，暂时无法跳转。";
+    else if (code == NavigationCode::Missing)
+      text = L"该会话已不在当前观察列表中，请在 ZCode 中查找。";
+    else if (code == NavigationCode::FocusFailed)
+      text = L"未能聚焦会话条目，请切回 ZCode 后重试。";
+    icon.uFlags |= NIF_INFO;
+    icon.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+    wcscpy_s(icon.szInfoTitle, L"未能定位 ZCode 会话");
+    wcscpy_s(icon.szInfo, text);
+  }
+  Shell_NotifyIconW(NIM_MODIFY, &icon);
+}
+void OpenSession(const Session &captured) {
+  if (SessionNavigationBusy())
+    return;
+  auto prepared = PrepareNavigation(captured, snapshot);
+  if (demo)
+    prepared.code = NavigationCode::Unavailable;
+  if (prepared.code != NavigationCode::Idle) {
+    NavigationFeedback(prepared.code);
+    return;
+  }
+  if (NavigateToSession(prepared.session))
+    NavigationFeedback(NavigationCode::Busy);
+}
+std::optional<Session> HitSession(HWND window, LPARAM position) {
+  if (!snapshot.error.empty() || !PopupTargetVisible(window))
+    return {};
+  RECT bounds;
+  GetClientRect(window, &bounds);
+  const int x = GET_X_LPARAM(position), y = GET_Y_LPARAM(position);
+  if (x < 0 || x >= bounds.right)
+    return {};
+  const int row = SessionRowAt(y / dpi, bounds.bottom / dpi, scroll,
+                               snapshot.sessions.size());
+  return row < 0 ? std::optional<Session>{} : snapshot.sessions[row];
+}
 // Experimental renderer: a real DirectWrite RGB coverage texture, encoded into
 // legal premultiplied BGRA using a reference backdrop (not exact live
 // ClearType).
@@ -592,6 +650,7 @@ void DrawPet() {
   }
   POINT origin{0, 0};
   SIZE size{side, side};
+  KeepRectangularPetHitArea(petCanvas.pixels,(size_t)side*side);
   BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
   UpdateLayeredWindow(pet, screen, nullptr, &size, petCanvas.dc, &origin, 0, &blend,
                       ULW_ALPHA);
@@ -758,6 +817,7 @@ void ShowNextCompletion() {
   if (completionQueue.empty() || IsWindowVisible(capsule))
     return;
   auto notice = completionQueue.front();
+  capsuleSession = notice;
   capsuleAttention = notice.waiting;
   capsuleTitle = notice.title;
   capsuleRecap = notice.waiting
@@ -953,7 +1013,31 @@ LRESULT CALLBACK CapsuleProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   case WM_PAINT:
     PaintCapsule();
     return 0;
-  case WM_LBUTTONUP:
+  case WM_SETCURSOR:
+    if (LOWORD(l) == HTCLIENT) {
+      SetCursor(LoadCursorW(nullptr, IDC_HAND));
+      return TRUE;
+    }
+    break;
+  case WM_LBUTTONDOWN:
+    noticePressed = capsuleSession;
+    SetCapture(h);
+    return 0;
+  case WM_LBUTTONUP: {
+    auto pressed = noticePressed;
+    noticePressed.reset();
+    if (GetCapture() == h)
+      ReleaseCapture();
+    RECT bounds;
+    GetClientRect(h, &bounds);
+    POINT point{GET_X_LPARAM(l), GET_Y_LPARAM(l)};
+    if (pressed && capsuleSession && SameSession(*pressed, *capsuleSession) &&
+        PtInRect(&bounds, point) && PopupTargetVisible(h))
+      OpenSession(*pressed);
+    return 0;
+  }
+  case WM_CAPTURECHANGED:
+    noticePressed.reset();
     return 0;
   case WM_CLOSE:
     ShowNoticeClose(capsuleDpi, false);
@@ -1062,9 +1146,33 @@ LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   case WM_RBUTTONUP:
     Menu();
     return 0;
-  case WM_LBUTTONUP:
+  case WM_SETCURSOR:
+    if (LOWORD(l) == HTCLIENT && !snapshot.sessions.empty() &&
+        snapshot.error.empty()) {
+      SetCursor(LoadCursorW(nullptr, IDC_HAND));
+      return TRUE;
+    }
+    break;
+  case WM_LBUTTONDOWN:
+    panelPressed = HitSession(h, l);
+    if (panelPressed)
+      SetCapture(h);
+    return 0;
+  case WM_LBUTTONUP: {
+    auto pressed = panelPressed;
+    panelPressed.reset();
+    const auto released = HitSession(h, l);
+    if (GetCapture() == h)
+      ReleaseCapture();
+    if (pressed && released && SameSession(*pressed, *released))
+      OpenSession(*pressed);
+    return 0;
+  }
+  case WM_CAPTURECHANGED:
+    panelPressed.reset();
     return 0;
   case WM_MOUSEWHEEL: {
+    panelPressed.reset();
     RECT r;
     GetClientRect(h, &r);
     int max = std::max(0, (int)snapshot.sessions.size() * (int)RowHeight -
@@ -1080,6 +1188,19 @@ LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 }
 LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   switch (msg) {
+  case NavigationCompleted:
+    if (const auto result = TakeNavigationResult())
+      NavigationFeedback(result->code);
+    return 0;
+  case NavigationQuery: {
+    const auto result = LastNavigationResult();
+    if (w >= 4)
+      return NavigationDiagnostic((unsigned)w - 4);
+    return w == 0   ? (LRESULT)result.code
+           : w == 1 ? result.matches
+           : w == 2 ? (LRESULT)result.action
+                    : SessionNavigationBusy();
+  }
   case VisualFrameMessage:
     BeginVisualFrame();
     PulsePopupAnimations();
@@ -1211,6 +1332,15 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
       stateMotion.Update(pending, (uint64_t)VisualClockMs(), IsWindowVisible(panel));
       snapshot = std::move(pending);
       stateClock.Update(snapshot, WallClockMs());
+      if (navigationPreview && !snapshot.sessions.empty()) {
+        // 显式本地验收入口，只生成一条已有会话的预览提醒，不伪造 ZCode 状态。
+        auto notice = snapshot.sessions.front();
+        notice.waiting = false;
+        notice.recap =
+            L"导航预览：点击正文打开对应已有会话；关闭钮只关闭提醒。";
+        completionQueue.push_back(std::move(notice));
+        navigationPreview = false;
+      }
       scroll = std::clamp(
           scroll, 0,
           std::max(0, ((int)snapshot.sessions.size() - VisibleRows()) *
@@ -1249,6 +1379,15 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   GetModuleFileNameW(nullptr, path, 32768);
   base = fs::path(path).parent_path();
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  if (wcsstr(command, L"--navigation-test")) {
+    DWORD pixels[] = {0, 0x00010203, 0xff345678, 0x02010101};
+    KeepRectangularPetHitArea(pixels, 4);
+    return NavigationModelTests() && pixels[0] == 0x01000000 &&
+                   pixels[1] == 0x01000000 && pixels[2] == 0xff345678 &&
+                   pixels[3] == 0x02010101
+               ? 0
+               : 1;
+  }
   if (wcsstr(command, L"--popup-motion-test"))
     return PopupMotionTests() ? 0 : 1;
   if (wcsstr(command, L"--floating-test"))
@@ -1363,6 +1502,18 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
       << " vblankClock=" << SendMessageW(character, VisualFrameInfoQuery, 1, 0)
       << " visualFrameAverageMs="
       << SendMessageW(character, VisualFrameInfoQuery, 2, 0) / 100. << "\n";
+    f << "navigationCode=" << SendMessageW(character, NavigationQuery, 0, 0)
+      << " navigationMatches=" << SendMessageW(character, NavigationQuery, 1, 0)
+      << " navigationAction=" << SendMessageW(character, NavigationQuery, 2, 0)
+      << " navigationBusy=" << SendMessageW(character, NavigationQuery, 3, 0)
+      << "\n";
+    f << "navigationWindows=" << SendMessageW(character, NavigationQuery, 4, 0)
+      << " navigationTitles=" << SendMessageW(character, NavigationQuery, 5, 0)
+      << " navigationRows=" << SendMessageW(character, NavigationQuery, 6, 0)
+      << " navigationProjectNames="
+      << SendMessageW(character, NavigationQuery, 7, 0)
+      << " navigationProjectType="
+      << SendMessageW(character, NavigationQuery, 8, 0) << "\n";
     return s.error.empty() ? 0 : 2;
   }
   if (wcsstr(command, L"--quit")) {
@@ -1373,6 +1524,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   }
   demo = wcsstr(command, L"--demo") != nullptr;
   preview = wcsstr(command, L"--preview") != nullptr;
+  navigationPreview =
+      preview && !demo && wcsstr(command, L"--navigation-preview");
   appStartedAt = (int64_t)std::chrono::duration_cast<std::chrono::milliseconds>(
                      std::chrono::system_clock::now().time_since_epoch())
                      .count();
@@ -1426,7 +1579,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
                           L"ZCode 会话", WS_POPUP, 0, 0, 288, 250, pet, nullptr,
                           inst, nullptr);
   capsule =
-      CreateWindowExW(popupStyle, L"ZCodePet.Completion", L"任务完成", WS_POPUP,
+      CreateWindowExW(preview ? popupStyle & ~WS_EX_NOACTIVATE : popupStyle,
+                      L"ZCodePet.Completion", L"任务完成", WS_POPUP,
                       0, 0, 260, 62, pet, nullptr, inst, nullptr);
   InitNoticeClose(capsule, preview);
   for (HWND surface : {panel, capsule})
@@ -1452,6 +1606,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   SetTimer(pet, 2, 40, nullptr);
   SetTimer(panel, 3, 100, nullptr);
   StartFrameClock(pet);
+  StartSessionNavigation(pet,NavigationCompleted);
   std::thread worker([] {
     auto demoStart = GetTickCount64();
     std::map<std::wstring, std::wstring> recapCache;
@@ -1553,6 +1708,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   }
   quitting = true;
   worker.join();
+  StopSessionNavigation();
   StopFrameClock();
   DestroyToolbar();
   ClearPopupAnimations();
