@@ -1,0 +1,5 @@
+Spine C++ runtime 4.2
+Upstream: https://github.com/EsotericSoftware/spine-runtimes
+Commit: e7dc1435fa4a0083ab431f1b28e083c14a1f5c68
+Vendored directories: spine-cpp/spine-cpp/include and src (unmodified).
+License: LICENSE (Spine Runtimes License Agreement, not the application license).

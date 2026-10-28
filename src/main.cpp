@@ -20,6 +20,8 @@
 #include "text_mask.h"
 #include "panel_composition.h"
 #include "resource.h"
+#include "spine_pet.h"
+#include "software_raster.h"
 #include <deque>
 #include <chrono>
 #include <cmath>
@@ -87,6 +89,10 @@ bool gpuProfileNoCache = false;
 bool gpuProfileNoMask = false;
 bool gpuProfileLegacy = false;
 PanelComposition panelComposition;
+SpinePet spinePet;
+bool spinePreferred=true;
+bool spineHardware=false;
+double lastSpineFrame=0;
 uint64_t panelDraws=0,noticeDraws=0,petDraws=0,visualFrames=0;
 uint64_t panelCacheBuilds=0,panelCacheHits=0,panelCacheFallbacks=0;
 int64_t appStartedAt = 0;
@@ -137,6 +143,7 @@ void LoadPreferences() {
                                       preferencesPath.c_str()) != 0;
   backdropMode = ReadBackdropMode((int)GetPrivateProfileIntW(
       L"UI", L"Backdrop", 0, preferencesPath.c_str()));
+  spinePreferred=GetPrivateProfileIntW(L"UI",L"Spine",1,preferencesPath.c_str())!=0;
   petSize =
       (float)std::clamp((int)GetPrivateProfileIntW(L"Size", L"PetDip", 128,
                                                    preferencesPath.c_str()),
@@ -158,6 +165,7 @@ void SavePreferences() {
                              preferencesPath.c_str());
   WritePrivateProfileStringW(L"UI", L"Backdrop",
       std::to_wstring((int)backdropMode).c_str(), preferencesPath.c_str());
+  WritePrivateProfileStringW(L"UI",L"Spine",spinePreferred ? L"1" : L"0",preferencesPath.c_str());
   WritePrivateProfileStringW(L"Size", L"PetDip",
                              std::to_wstring((int)petSize).c_str(),
                              preferencesPath.c_str());
@@ -173,6 +181,8 @@ constexpr UINT Refresh = WM_APP + 1, Tray = WM_APP + 2,
                NoticeInfoQuery=WM_APP+32,GpuRenderQuery=WM_APP+34;
 constexpr UINT CompositionQuery=WM_APP+36;
 constexpr UINT TrayInfoQuery=WM_APP+38;
+constexpr UINT SpineInfoQuery=WM_APP+40;
+void UseRenderer(bool spine,bool remember=false);
 void UpdateTrayIcon(bool reload=false) {
   HICON previous=trayIcon;
   const bool previousOwned=trayIconOwned;
@@ -881,8 +891,30 @@ void PaintPanel() {
   }
   EndPaint(panel, &ps);
 }
+void ClampPetPosition() {
+  const int side=(int)(petSize*GetDpiForWindow(pet)/96.f);
+  // Mouse movement owns positioning during a drag. An animation frame must
+  // never pull the window back against a still-captured pointer.
+  if (dragging)
+    return;
+  RECT bounds;
+  GetWindowRect(pet, &bounds);
+  MONITORINFO monitor{sizeof(monitor)};
+  GetMonitorInfoW(MonitorFromWindow(pet, MONITOR_DEFAULTTONEAREST), &monitor);
+  const auto position = ClampPetToWorkArea({bounds.left, bounds.top},
+                                           {side, side}, monitor.rcWork);
+  if (position.x != bounds.left || position.y != bounds.top)
+    SetWindowPos(pet, nullptr, position.x, position.y, 0, 0,
+                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
+}
 void DrawPet() {
   ++petDraws;
+  if(spinePet.Ready()) {
+    spinePet.Render(0,(int)(petSize*GetDpiForWindow(pet)/96.f));
+    lastSpineFrame=VisualClockMs();
+    ClampPetPosition();
+    return;
+  }
   if (!animation)
     return;
   int side = (int)(petSize * GetDpiForWindow(pet) / 96.f);
@@ -908,23 +940,18 @@ void DrawPet() {
   UpdateLayeredWindow(pet, screen, nullptr, &size, petCanvas.dc, &origin, 0, &blend,
                       ULW_ALPHA);
   ReleaseDC(nullptr, screen);
-  // Mouse movement owns positioning during a drag. An animation frame must
-  // never pull the window back against a still-captured pointer.
-  if (dragging)
-    return;
-  RECT bounds;
-  GetWindowRect(pet, &bounds);
-  MONITORINFO monitor{sizeof(monitor)};
-  GetMonitorInfoW(MonitorFromWindow(pet, MONITOR_DEFAULTTONEAREST), &monitor);
-  const auto position = ClampPetToWorkArea({bounds.left, bounds.top},
-                                           {side, side}, monitor.rcWork);
-  if (position.x != bounds.left || position.y != bounds.top)
-    SetWindowPos(pet, nullptr, position.x, position.y, 0, 0,
-                 SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
+  ClampPetPosition();
 }
 void SetAnimation(const std::wstring &name) {
   if (name == animationName)
     return;
+  if(spinePet.Ready()) {
+    if(spinePet.SetState(name)) {
+      animationName=name;DrawPet();
+      RequestPetFrames(gpuProfileFrozenGif ? 0 : spinePet.DesiredFps());
+    }
+    return;
+  }
   auto image = std::make_unique<Gdiplus::Image>(
       (base / L"assets" / (name + L".gif")).c_str());
   if (image->GetLastStatus() != Gdiplus::Ok)
@@ -948,6 +975,22 @@ void SetAnimation(const std::wstring &name) {
   DrawPet();
   if (gpuProfileFrozenGif) KillTimer(pet,1);
   else SetTimer(pet, 1, delays[0], nullptr);
+}
+void UseRenderer(bool spine,bool remember) {
+  if(remember)spinePreferred=spine;
+  if((spine && spinePet.Ready()) || (!spine && animation))return;
+  const auto logical=animationName.empty() ? L"idle" : animationName;
+  RequestPetFrames(0);KillTimer(pet,1);
+  spinePet.Shutdown();animation.reset();petCanvas.Reset();animationName.clear();
+  auto style=GetWindowLongPtrW(pet,GWL_EXSTYLE);
+  auto applyStyle=[&](bool native) {
+    SetWindowLongPtrW(pet,GWL_EXSTYLE,native ? (style&~WS_EX_LAYERED)|WS_EX_NOREDIRECTIONBITMAP
+                                           : (style&~WS_EX_NOREDIRECTIONBITMAP)|WS_EX_LAYERED);
+    SetWindowPos(pet,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED);
+  };
+  applyStyle(spine && spineHardware);
+  if(spine && !spinePet.Initialize(pet,base/L"assets/spine",spineHardware))applyStyle(false);
+  SetAnimation(logical);
 }
 void DismissPanel() {
   if (panelPinned) {
@@ -1468,9 +1511,10 @@ LRESULT CALLBACK CapsuleProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 }
 ToolbarState ToolbarValues() {
   return {panelPinned, experimental, (int)petSize,
-          (int)std::lround(panelZoom * 100), strength, backdropMode};
+          (int)std::lround(panelZoom * 100), strength, backdropMode,spinePet.Ready()};
 }
 void ExecuteToolbarAction(int id) {
+  if(id==40 || id==41) {UseRenderer(id==40,true);SavePreferences();}
   if (id >= 30 && id <= 32) {
     backdropMode = ReadBackdropMode(id-30);
     SendMessageW(panel,BackdropChanged,0,0);
@@ -1637,6 +1681,8 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     trayRegistered=false;UpdateTrayIcon();return 0;
   }
   switch (msg) {
+  case SpineInfoQuery:
+    return spinePet.Metric((unsigned)w);
   case TrayInfoQuery:
     return w==0 ? trayRegistered : w==1 ? trayIcon!=nullptr : trayVersion4;
   case CompositionQuery:
@@ -1692,6 +1738,17 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   case VisualFrameMessage:
     ++visualFrames;
     BeginVisualFrame();
+    if(spinePet.Ready() && !gpuProfileFrozenGif) {
+      const auto now=VisualClockMs();
+      const auto interval=1000./spinePet.DesiredFps();
+      if(w==1 || now-lastSpineFrame>=interval-.25) {
+        const auto delta=(float)((now-lastSpineFrame)/1000.);
+        if(spinePet.Render(delta,(int)(petSize*GetDpiForWindow(pet)/96.f))) {
+          ++petDraws;lastSpineFrame=now;
+        } else UseRenderer(false);
+      }
+      RequestPetFrames(spinePet.Ready() ? spinePet.DesiredFps() : 0);
+    }
     PulsePopupAnimations();
     TickPanel(true);
     PulseInteractionFeedback();
@@ -1700,6 +1757,8 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     UpdateNoticeHovers();
     return 0;
   case VisualFrameInfoQuery:
+    if(w==5)return FrameClockPetFps();
+    if(w==6)return FrameClockContinuousRequested();
     if (w == 3)
       return FrameClockInteractionRequested();
     if (w == 4)
@@ -1898,12 +1957,19 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   return DefWindowProcW(h, msg, w, l);
 }
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
+  if(wcsstr(command,L"--frame-clock-test"))return FrameClockTimingTests() ? 0 : 1;
+  if(wcsstr(command,L"--raster-test"))return SoftwareRasterTests() ? 0 : 1;
   if (wcsstr(command,L"--composition-test")) return PanelCompositionTests() ? 0 : 1;
   if (wcsstr(command,L"--panel-scene-test")) return PanelSceneTests() ? 0 : 1;
   instance = inst;
   wchar_t path[32768];
   GetModuleFileNameW(nullptr, path, 32768);
   base = fs::path(path).parent_path();
+  if(wcsstr(command,L"--spine-lifecycle-test"))return SpineLifecycleTests(base/L"assets/spine") ? 0 : 1;
+  if(wcsstr(command,L"--spine-model-test"))return SpineModelTests(base/L"assets/spine") ? 0 : 1;
+  if (wcsstr(command,L"--spine-render-test"))
+    return RenderSpinePreview(base/L"assets/spine",base/(wcsstr(command,L"--software") ? L"spine-preview-soft" : L"spine-preview"),
+                               !wcsstr(command,L"--software")) ? 0 : 1;
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   if (wcsstr(command,L"--notice-test")) return NoticeModelTests() ? 0 : 1;
   if (wcsstr(command, L"--interaction-motion-test"))
@@ -2121,6 +2187,16 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
     f << "trayRegistered=" << SendMessageW(character,TrayInfoQuery,0,0)
       << " trayIconLoaded=" << SendMessageW(character,TrayInfoQuery,1,0)
       << " trayVersion4=" << SendMessageW(character,TrayInfoQuery,2,0) << "\n";
+    f << "spineReady=" << SendMessageW(character,SpineInfoQuery,0,0)
+      << " spineResult=" << SendMessageW(character,SpineInfoQuery,1,0)
+      << " spineFrames=" << SendMessageW(character,SpineInfoQuery,2,0)
+      << " spineVertices=" << SendMessageW(character,SpineInfoQuery,3,0)
+      << " spineBatches=" << SendMessageW(character,SpineInfoQuery,4,0)
+      << " spineTransitions=" << SendMessageW(character,SpineInfoQuery,5,0)
+      << " spineErrors=" << SendMessageW(character,SpineInfoQuery,6,0)
+      << " spineHardware=" << SendMessageW(character,SpineInfoQuery,7,0) << "\n";
+    f << "petRequestedFps=" << SendMessageW(character,VisualFrameInfoQuery,5,0)
+      << " panelContinuousFrames=" << SendMessageW(character,VisualFrameInfoQuery,6,0) << "\n";
     return s.error.empty() ? 0 : 2;
   }
   if (wcsstr(command, L"--quit")) {
@@ -2207,8 +2283,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   InitToolbar(pet, factory.Get(), writeFactory.Get(), ToolbarValues,
               ExecuteToolbarAction, ApplySurfaceMaterial, ToolbarObstacles, preview);
   UpdateTrayIcon();
-  SetAnimation(L"idle");
-  if (!animation) {
+  const bool forceGif=wcsstr(command,L"--gif") || gpuProfileScene.find(L"gif")!=std::wstring::npos;
+  spineHardware=wcsstr(command,L"--spine-gpu") || gpuProfileScene.find(L"spine-gpu")!=std::wstring::npos;
+  UseRenderer((!gpuProfileScene.empty() || spinePreferred || spineHardware) && !forceGif);
+  if (!spinePet.Ready() && !animation) {
     MessageBoxW(nullptr, L"缺少 assets/idle.gif，请保持素材目录和 EXE 在一起。",
                 L"ZCode Pet", MB_ICONERROR);
     DestroyWindow(pet);
@@ -2346,6 +2424,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   worker.join();
   StopSessionNavigation();
   StopFrameClock();
+  spinePet.Shutdown();
   panelComposition.Shutdown();
   DestroyToolbar();
   ClearPopupAnimations();

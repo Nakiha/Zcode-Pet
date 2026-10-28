@@ -1,4 +1,5 @@
 #include "panel_composition.h"
+#include "composition_device.h"
 #include "theme.h"
 #include <d3d11.h>
 #include <d2d1_1.h>
@@ -33,7 +34,6 @@ struct PanelComposition::Impl {
   bool attempted = false, ready = false;
   HRESULT result = S_OK;
   uint64_t uploads = 0, starts = 0, updates = 0, failures = 0;
-  winrt::Windows::System::DispatcherQueueController queue{nullptr};
   Compositor compositor{nullptr};
   Desktop::DesktopWindowTarget target{nullptr};
   ContainerVisual root{nullptr};
@@ -227,32 +227,14 @@ bool PanelComposition::Ensure(HWND window) noexcept {
     return s.ready;
   s.attempted = true;
   try {
-    if (!winrt::Windows::System::DispatcherQueue::GetForCurrentThread()) {
-      DispatcherQueueOptions options{sizeof(options), DQTYPE_THREAD_CURRENT,
-                                     DQTAT_COM_NONE};
-      check_hresult(CreateDispatcherQueueController(
-          options,
-          reinterpret_cast<ABI::Windows::System::IDispatcherQueueController **>(
-              put_abi(s.queue))));
-    }
-    s.compositor = Compositor();
-    auto host = s.compositor.as<Interop::Desktop::ICompositorDesktopInterop>();
-    check_hresult(host->CreateDesktopWindowTarget(
-        window, TRUE,
-        reinterpret_cast<Interop::Desktop::IDesktopWindowTarget **>(
-            put_abi(s.target))));
-    check_hresult(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
-                                    D3D11_CREATE_DEVICE_BGRA_SUPPORT, nullptr,
-                                    0, D3D11_SDK_VERSION, &s.d3d, nullptr,
-                                    nullptr));
-    ComPtr<IDXGIDevice> dxgi;
-    check_hresult(s.d3d.As(&dxgi));
-    check_hresult(D2D1CreateDevice(dxgi.Get(), nullptr, &s.d2d));
-    check_hresult(
-        s.compositor.as<Interop::ICompositorInterop>()->CreateGraphicsDevice(
-            s.d2d.Get(),
-            reinterpret_cast<Interop::ICompositionGraphicsDevice **>(
-                put_abi(s.graphics))));
+    auto &shared=SharedCompositionDevice();
+    s.compositor=shared.compositor;
+    s.graphics=shared.graphics;
+    s.d3d=shared.d3d;
+    s.d2d=shared.d2d;
+    auto host=s.compositor.as<Interop::Desktop::ICompositorDesktopInterop>();
+    check_hresult(host->CreateDesktopWindowTarget(window,TRUE,
+        reinterpret_cast<Interop::Desktop::IDesktopWindowTarget**>(put_abi(s.target))));
     s.root = s.compositor.CreateContainerVisual();
     s.clock = s.compositor.CreatePropertySet();
     s.clock.InsertScalar(L"phase", 0);
@@ -410,8 +392,6 @@ void PanelComposition::Shutdown() noexcept {
     s.root = nullptr;
     s.target = nullptr;
     s.graphics = nullptr;
-    if (s.compositor)
-      s.compositor.Close();
     s.compositor = nullptr;
     s.d2d.Reset();
     s.d3d.Reset();
@@ -431,25 +411,7 @@ LRESULT PanelComposition::Metric(unsigned field) const noexcept {
 }
 void PanelComposition::FinishThread() noexcept {
   Shutdown();
-  try {
-    if (impl->queue) {
-      auto finished = impl->queue.ShutdownQueueAsync();
-      while (finished.Status() ==
-             winrt::Windows::Foundation::AsyncStatus::Started) {
-        MSG message{};
-        if (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
-          if (message.message != WM_QUIT) {
-            TranslateMessage(&message);
-            DispatchMessageW(&message);
-          }
-        } else
-          MsgWaitForMultipleObjects(0, nullptr, FALSE, 50, QS_ALLINPUT);
-      }
-      impl->queue = nullptr;
-    }
-  } catch (...) {
-    impl->queue = nullptr;
-  }
+  FinishCompositionThread();
 }
 bool PanelCompositionTests() {
   const auto apartment = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);

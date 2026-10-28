@@ -6,11 +6,14 @@
 #include <mutex>
 #include <thread>
 #include <algorithm>
+#include <cmath>
 
 using Microsoft::WRL::ComPtr;
 namespace {
-std::atomic_bool running = false, motion = false, continuous = false, pending = false;
+std::atomic_bool running = false, motion = false, continuous = false,
+                 pending = false;
 std::atomic_bool interaction = false;
+std::atomic_int petFps = 0;
 std::atomic<HMONITOR> currentMonitor = nullptr;
 std::atomic_uint generation = 0;
 std::atomic_int displayHz = 60;
@@ -19,6 +22,7 @@ std::atomic<double> averageFrame = 0;
 std::mutex mutex;
 std::condition_variable wake;
 std::thread worker;
+HANDLE cadenceWake = nullptr;
 HWND target;
 double lastUiFrame = 0;
 
@@ -32,7 +36,22 @@ double Now() {
   QueryPerformanceCounter(&value);
   return value.QuadPart / frequency;
 }
-bool Needed() { return motion.load() || continuous.load() || interaction.load(); }
+bool UiNeeded() {
+  return motion.load() || continuous.load() || interaction.load();
+}
+bool Needed() { return UiNeeded() || petFps.load() > 0; }
+void Signal() {
+  if (cadenceWake)
+    SetEvent(cadenceWake);
+  wake.notify_all();
+}
+double FrameDeadline(double now, double previous, int fps) {
+  const double interval = 1000. / std::max(1, fps);
+  // Some detached/blanked outputs return S_OK from WaitForVBlank without
+  // waiting. Never allow that driver behavior to become an unbounded loop.
+  return previous > 0 && now - previous < interval * .9 ? previous + interval
+                                                        : now;
+}
 ComPtr<IDXGIOutput> OutputFor(HMONITOR monitor) {
   ComPtr<IDXGIFactory1> factory;
   if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))))
@@ -71,13 +90,32 @@ int RefreshRate(HMONITOR monitor) {
 void Run() {
   const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr,
-      CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+                                        CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                        TIMER_ALL_ACCESS);
   if (!timer)
     timer = CreateWaitableTimerW(nullptr, FALSE, nullptr);
   ComPtr<IDXGIOutput> output;
   HMONITOR selected = nullptr;
   unsigned selectedGeneration = ~0u;
-  double nextFrame = 0;
+  double nextFrame = 0, lastSignal = 0;
+  bool previousPetOnly = false;
+  int previousRate = 0;
+  auto waitUntil = [&](double deadline) {
+    const double delay = std::max(0., deadline - Now());
+    LARGE_INTEGER due;
+    due.QuadPart = -(LONGLONG)std::max(1., delay * 10000.);
+    if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) {
+      HANDLE handles[] = {timer, cadenceWake};
+      return WaitForMultipleObjects(cadenceWake ? 2 : 1, handles, FALSE,
+                                    (DWORD)(delay + 100)) != WAIT_OBJECT_0 + 1;
+    }
+    if (cadenceWake)
+      return WaitForSingleObject(cadenceWake,
+                                 (DWORD)std::max(1., std::ceil(delay))) ==
+             WAIT_TIMEOUT;
+    Sleep((DWORD)std::max(1., std::ceil(delay)));
+    return true;
+  };
   while (running) {
     {
       std::unique_lock lock(mutex);
@@ -93,25 +131,42 @@ void Run() {
       output = OutputFor(monitor);
       displayHz = RefreshRate(monitor);
       nextFrame = Now();
+      lastSignal = 0;
     }
-    bool synced = output && SUCCEEDED(output->WaitForVBlank());
+    const bool petOnly = !UiNeeded() && petFps.load() > 0;
+    const int rate =
+        std::max(1, petOnly ? std::min(petFps.load(), displayHz.load())
+                            : displayHz.load());
+    if (petOnly != previousPetOnly || rate != previousRate) {
+      nextFrame = Now();
+      lastSignal = 0;
+      previousPetOnly = petOnly;
+      previousRate = rate;
+    }
+    bool synced = !petOnly && output && SUCCEEDED(output->WaitForVBlank());
     usingVBlank = synced;
+    if (synced) {
+      const auto now = Now(), deadline = FrameDeadline(now, lastSignal, rate);
+      if (deadline > now) {
+        usingVBlank = false;
+        if (!waitUntil(deadline))
+          continue;
+      }
+    }
     if (!synced) {
-      output.Reset();
-      const double interval = 1000. / std::max(1, displayHz.load());
+      if (!petOnly)
+        output.Reset();
+      const double interval = 1000. / rate;
       const double now = Now();
       if (nextFrame < now - interval)
         nextFrame = now;
       nextFrame += interval;
-      LARGE_INTEGER due;
-      due.QuadPart = -(LONGLONG)std::max(1., (nextFrame - now) * 10000.);
-      if (timer && SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
-        WaitForSingleObject(timer, (DWORD)(interval + 100));
-      else
-        Sleep((DWORD)std::max(1., interval));
+      if (!waitUntil(nextFrame))
+        continue;
     }
+    lastSignal = Now();
     if (running && Needed() && !pending.exchange(true)) {
-      if (!PostMessageW(target, VisualFrameMessage, 0, 0))
+      if (!PostMessageW(target, VisualFrameMessage, petOnly ? 1 : 0, 0))
         pending = false;
     }
   }
@@ -127,6 +182,7 @@ void StartFrameClock(HWND dispatcher) {
   target = dispatcher;
   currentMonitor = MonitorFromWindow(dispatcher, MONITOR_DEFAULTTONEAREST);
   running = true;
+  cadenceWake = CreateEventW(nullptr, FALSE, FALSE, nullptr);
   worker = std::thread(Run);
 }
 void StopFrameClock() {
@@ -134,16 +190,19 @@ void StopFrameClock() {
     std::lock_guard lock(mutex);
     running = false;
   }
-  wake.notify_all();
+  Signal();
   if (worker.joinable())
     worker.join();
   pending = false;
+  if (cadenceWake)
+    CloseHandle(cadenceWake);
+  cadenceWake = nullptr;
 }
 void SetFrameClockMonitor(HMONITOR monitor, bool force) {
   const bool changed = currentMonitor.exchange(monitor) != monitor;
   if (changed || force) {
     ++generation;
-    wake.notify_all();
+    Signal();
   }
 }
 void RequestMotionFrames(bool enabled) {
@@ -153,7 +212,7 @@ void RequestMotionFrames(bool enabled) {
     std::lock_guard lock(mutex);
     motion = enabled;
   }
-  wake.notify_all();
+  Signal();
 }
 void RequestContinuousFrames(bool enabled) {
   if (continuous.load() == enabled)
@@ -162,7 +221,7 @@ void RequestContinuousFrames(bool enabled) {
     std::lock_guard lock(mutex);
     continuous = enabled;
   }
-  wake.notify_all();
+  Signal();
 }
 void BeginVisualFrame() {
   pending = false;
@@ -181,7 +240,17 @@ void RequestInteractionFrames(bool enabled) {
     std::lock_guard lock(mutex);
     interaction = enabled;
   }
-  wake.notify_all();
+  Signal();
+}
+void RequestPetFrames(int fps) {
+  fps = std::clamp(fps, 0, 120);
+  if (petFps.load() == fps)
+    return;
+  {
+    std::lock_guard lock(mutex);
+    petFps = fps;
+  }
+  Signal();
 }
 int FrameClockDisplayHz() { return displayHz; }
 bool FrameClockUsesVBlank() { return usingVBlank; }
@@ -189,3 +258,16 @@ double FrameClockAverageMs() { return averageFrame; }
 double VisualClockMs() { return Now(); }
 bool FrameClockInteractionRequested() { return interaction; }
 bool FrameClockFramesNeeded() { return Needed(); }
+int FrameClockPetFps() { return petFps; }
+bool FrameClockContinuousRequested() { return continuous; }
+bool FrameClockTimingTests() {
+  if (std::abs(FrameDeadline(100.1, 100, 120) - 108.3333333) > .001)
+    return false;
+  if (FrameDeadline(1000, 100, 120) != 1000)
+    return false;
+  double now = 100;
+  for (int i = 0; i < 120; ++i)
+    now = FrameDeadline(now + .01, now, 120);
+  return std::abs(now - 1100) < .001 &&
+         std::abs(FrameDeadline(100.1, 100, 60) - 116.6666667) < .001;
+}

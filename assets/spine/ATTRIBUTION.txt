@@ -1,0 +1,14 @@
+Character resource: supplied by the user as Q版蕾米.zip.
+Runtime exports: Q蕾米.json (renamed remilia.json), leimi.atlas, leimi.png.
+Export version: Spine 4.2.43. Animation data and textures are unmodified.
+The supplied archive contains no separate artwork license or author notice.
+This project does not grant additional rights to the character artwork.
+
+Spine runtime: Esoteric Software spine-cpp 4.2.
+The official Spine Runtimes License Agreement is provided in
+SPINE-RUNTIME-LICENSE.txt and third_party/spine-cpp/LICENSE in source.
+It is not an MIT or other permissively licensed dependency.
+Use and redistribution must comply with its terms. When not covered by an
+applicable Spine Editor license under the referenced Editor agreement,
+the runtime agreement requires each user of the product to obtain their
+own Spine Editor license. See the full, unmodified license.

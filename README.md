@@ -2,6 +2,28 @@
 
 独立 C++ Win32 桌宠，直接只读观察已经运行的官方 ZCode，无需修改安装包、源码、配置或启用调试端口，也不启动新 agent。
 
+## Spine 预览版（0.2.0）
+
+[下载发布包](https://github.com/Nakiha/Zcode-Pet/releases) · [GIF / GPU 优化版 0.1.0](https://github.com/Nakiha/Zcode-Pet/releases/tag/v0.1.0)
+
+默认加载用户提供的 Spine 4.2.43 导出，使用固定版本的官方 spine-cpp 4.2（完整上游来源见 `third_party/spine-cpp/UPSTREAM.txt`）。通过 AnimationState 混合衔接动作，默认 0.22 秒；不把 Spine 转成 GIF 播放。工具栏“宠物大小”页可以切换 Spine/GIF，选择保存；Spine 资源不可用时回退 GIF。启动参数 `--gif` 仅本次强制使用原始 GIF。
+
+| 状态 | Spine 动画 |
+|---|---|
+| 空闲 | a |
+| 工作中 | d |
+| 等待回答 / 空闲悬停 | e |
+| 新完成动作 | c |
+| 错误、中断、拖动 | b |
+
+映射、混合时间和角色帧率可在 `assets/spine/animations.ini` 调整，重启生效。角色正常按素材节奏以 30 FPS 更新，切换混合期间 60 FPS；界面加载弧线、扫光和浮层交互独立跟随显示器刷新率。默认角色使用小画布软件三角形渲染及双线性采样，避免每秒额外向 GPU 提交角色帧；不改变骨骼、网格、裁剪、颜色混合或动作衔接。保留 `--spine-gpu` 原生 D3D11 后端作对照，它与面板共用设备，不引入 SDL/SFML/游戏引擎。
+
+本机默认 224 px 角色的同轮对照：仅角色时 GIF/Spine 的应用 GPU 3D 均接近 0%，CPU 约 0.36%/0.40%；含三个工作会话时 GIF GPU 约 0.066%，Spine 两轮约 0.082%/0.067%，CPU 约 0.44%/0.38%。这些是此机器的整体进程计数，不代表整卡功耗；该轮桌面流媒体采集已停止，DWM 计数没有可用于归因的数据。直接 GPU 角色路径在该小尺寸下约 0.9%～1.5%，故未作为默认。九个动画的 512 px 软件/硬件参考图预乘通道平均差异均低于 0.1/255，无单像素差异超过 8/255。
+
+**许可：Spine 运行时不是 MIT/宽松许可证。** 包内附官方完整运行时许可证，使用与分发须遵守其中条款；若无适用的 Spine Editor 许可覆盖，运行时许可证要求每个产品使用者自行取得 Spine Editor 许可。详见 [官方运行时许可](https://esotericsoftware.com/spine-runtimes-license) 和 `assets/spine/SPINE-RUNTIME-LICENSE.txt`。用户提供的角色包未附单独美术许可，本项目不对角色素材另行授予使用权，来源见 `assets/spine/ATTRIBUTION.txt`。不需要 Spine 功能时可选不含 Spine runtime 的 0.1.0 发布包。
+
+![Spine 状态预览](docs/spine-states.png)
+
 ## 运行
 
 解压便携包，双击 `ZCodePet.exe`。保持 `assets` 文件夹与 EXE 同目录。
@@ -87,6 +109,8 @@ v25 已将面板基底和运行态动画改为系统 Windows Composition 合成�
 `--demo --preview --panel` 使用本地演示事件：8 秒首个会话完成、10 秒第二个会话完成，另一个会话持续工作；12 秒新增等待提醒，14 秒重命名首个会话，18 秒首个会话进入新一轮并清理旧完成提醒。可验证多气泡、完成动画、名称同步、单独关闭及新轮清理，不给 ZCode 发任务或写入状态。正式运行不加 demo/preview。
 
 `--preview --panel --navigation-preview` 读取真实会话并生成一条本地完成提醒用于导航验收，不发送消息或改变 ZCode 状态。演示模式禁用导航。`--navigation-test` 检查身份、标题、歧义和命中规则；`--notice-test` 检查名称同步、明确新轮清理、失败保留以及多个完成动作。二者均加入 CTest。
+
+`--spine-render-test` / `--spine-render-test --software` 为九个动作生成透明 PNG 参考图，仅在显式诊断时读取 GPU 结果；正常渲染不做 GPU 回读。`--spine-model-test` 验证五个状态的骨骼/网格及混合，`--spine-lifecycle-test` 验证反复加载、混合帧率、GDI 资源归还和缺失资源回退，`--raster-test` 检查共享三角形边缘无缝且不重复混合。`--frame-clock-test` 防止息屏/无效输出让 WaitForVBlank 立即返回后出现无限快循环；实际节拍不超过显示器频率，角色低频等待可被交互立即打断。以上均加入 CTest。probe 增加 spineReady/Result/Frames/Vertices/Batches/Transitions/Errors/Hardware、petRequestedFps 和 panelContinuousFrames；角色时钟活动不表示面板在逐帧重绘。
 
 `--interaction-motion-test` 检查交互曲线、中途反向、短按保留、移出取消、单调性和归位末帧，已加入 CTest。`--probe` 的 `interactionFrames` / `visualFramesNeeded` 可检查反馈结束后是否停止高频帧；本机三个浮层均为 hardware，120 Hz 垂直同步下约 8.32 ms，静态悬停时两个帧需求均归零。
 

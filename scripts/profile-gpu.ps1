@@ -108,6 +108,10 @@ try {
       CompositionUploadsPerSecond=($after.compositionUploads-$before.compositionUploads)/$renderElapsed;
       CompositionStarts=$after.compositionStarts-$before.compositionStarts;
       CompositionBaseDrawsPerSecond=($after.compositionBaseDraws-$before.compositionBaseDraws)/$renderElapsed;
+      SpineReady=$after.spineReady;
+      SpineFramesPerSecond=($after.spineFrames-$before.spineFrames)/$renderElapsed;
+      SpineErrors=$after.spineErrors-$before.spineErrors;
+      SpineVertices=$after.spineVertices;SpineBatches=$after.spineBatches;
       DedicatedMiB=($memory | Measure-Object DedicatedUsage -Sum).Sum/1MB;
       SharedMiB=($memory | Measure-Object SharedUsage -Sum).Sum/1MB;
       BoardUtilizationPercent=[double]$hardware[0]; BoardPowerWatts=[double]$hardware[1]; BoardGraphicsClockMHz=[double]$hardware[2];
