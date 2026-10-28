@@ -240,11 +240,11 @@ void SyncFeedback() {
     const bool active = Selected(id, state);
     const bool hot = opened && (hovered == i || (keyMode && focus == i));
     const bool down = hot && pressed == i;
-    const float opacity = active ? down  ? .32f
-                                   : hot ? .21f
+    const float opacity = active ? down  ? .36f
+                                   : hot ? .25f
                                          : .18f
-                          : down ? .23f
-                          : hot  ? .09f
+                          : down ? .28f
+                          : hot  ? .14f
                                  : 0;
     SetInteractionFeedback(window, FeedbackKey(id), {hot, down}, opacity);
     SetInteractionFeedback(window, SelectedKey(id), {active, false},

@@ -192,7 +192,7 @@ void UpdatePanelFeedback() {
   panelHotKey = next;
   if (hit) {
     const bool down = panelPressed && SameSession(*panelPressed, *hit);
-    SetInteractionFeedback(panel, next, {true, down}, down ? .23f : .075f);
+    SetInteractionFeedback(panel, next, {true, down}, down ? .30f : .16f);
   }
 }
 void UpdateNoticeFeedback() {
@@ -203,8 +203,8 @@ void UpdateNoticeFeedback() {
   const bool down = hot && noticePressed && capsuleSession &&
                     SameSession(*noticePressed, *capsuleSession);
   SetInteractionFeedback(capsule, L"body", {hot, down},
-                         down  ? .20f
-                         : hot ? .055f
+                         down  ? .28f
+                         : hot ? .14f
                                : 0);
 }
 // Experimental renderer: a real DirectWrite RGB coverage texture, encoded into
@@ -604,7 +604,7 @@ void PaintPanel() {
     float width = rc.right / dpi, height = rc.bottom / dpi;
     const auto animationNow = (uint64_t)VisualClockMs();
     PetTheme::PaintSurface(target.Get(), width, height,
-                           SUCCEEDED(panelMaterialResult));
+                           SUCCEEDED(panelMaterialResult),8.f,false);
     ComPtr<ID2D1SolidColorBrush> brush;
     target->CreateSolidColorBrush(D2D1::ColorF(1, 1, 1, .20f), &brush);
     target->PushAxisAlignedClip(D2D1::RectF(0, 0, width, height),
@@ -620,8 +620,8 @@ void PaintPanel() {
           continue;
         auto &session = snapshot.sessions[i];
         PetTheme::PaintFeedback(
-            target.Get(), D2D1::RectF(4, y + 3, width - 4, y + RowHeight - 3),
-            InteractionOpacity(panel, FeedbackKey(session)));
+            target.Get(), D2D1::RectF(0,y,width,y+RowHeight),
+            InteractionOpacity(panel, FeedbackKey(session)),0);
         if (i + 1 < snapshot.sessions.size() && y + RowHeight < height) {
           brush->SetColor(D2D1::ColorF(PetTheme::Divider, .42f));
           target->DrawLine(D2D1::Point2F(RowSidePadding, y + RowHeight - .5f),
@@ -662,6 +662,7 @@ void PaintPanel() {
                11.5f, D2D1::ColorF(tone.ink), true, false, true);
       }
     target->PopAxisAlignedClip();
+    PetTheme::PaintSurfaceBorder(target.Get(),width,height);
     if (target->EndDraw() == D2DERR_RECREATE_TARGET)
       target.Reset();
   }
@@ -950,10 +951,10 @@ void PaintCapsule() {
     target->BeginDraw();
     const float width = rc.right / dpi, height = rc.bottom / dpi;
     PetTheme::PaintSurface(target.Get(), width, height,
-                           SUCCEEDED(capsuleMaterialResult));
+                           SUCCEEDED(capsuleMaterialResult),8.f,false);
     PetTheme::PaintFeedback(target.Get(),
-                            D2D1::RectF(1, 1, width - 1, height - 1),
-                            InteractionOpacity(capsule, L"body"), 7);
+                           D2D1::RectF(0,0,width,height),
+                           InteractionOpacity(capsule, L"body"),0);
     const float badgeY = height / 2;
     ComPtr<ID2D1SolidColorBrush> green;
     const auto tone = StateTone(capsuleAttention ? SessionState::Waiting
@@ -1031,6 +1032,7 @@ void PaintCapsule() {
         target->PopAxisAlignedClip();
       }
     }
+    PetTheme::PaintSurfaceBorder(target.Get(),width,height);
     if (target->EndDraw() == D2DERR_RECREATE_TARGET)
       target.Reset();
   }
