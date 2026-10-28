@@ -18,6 +18,7 @@
 #include "notice_model.h"
 #include "panel_scene.h"
 #include "text_mask.h"
+#include "panel_composition.h"
 #include <deque>
 #include <chrono>
 #include <cmath>
@@ -80,6 +81,8 @@ bool gpuProfileNoAcrylic=false,gpuProfileNoShimmer=false,gpuProfileNoSpinner=fal
      gpuProfileFrozenGif=false,gpuProfilePetOnly=false;
 bool gpuProfileNoCache = false;
 bool gpuProfileNoMask = false;
+bool gpuProfileLegacy = false;
+PanelComposition panelComposition;
 uint64_t panelDraws=0,noticeDraws=0,petDraws=0,visualFrames=0;
 uint64_t panelCacheBuilds=0,panelCacheHits=0,panelCacheFallbacks=0;
 int64_t appStartedAt = 0;
@@ -97,6 +100,7 @@ struct PanelTextureCache {
   std::optional<PanelScene> scene;
   void Reset() { bitmap.Reset(); surface.Reset(); owner.Reset(); scene.reset(); }
 } panelTexture;
+std::optional<PanelScene> lastPanelScene;
 Snapshot snapshot;
 int VisibleRows() { return std::clamp((int)snapshot.sessions.size(), 1, 3); }
 float PanelHeight() { return VisibleRows() * RowHeight; }
@@ -163,6 +167,7 @@ LRESULT CALLBACK CapsuleProc(HWND,UINT,WPARAM,LPARAM);
 constexpr UINT Refresh = WM_APP + 1, Tray = WM_APP + 2,
                NavigationCompleted = WM_APP + 30, NavigationQuery = WM_APP + 31,
                NoticeInfoQuery=WM_APP+32,GpuRenderQuery=WM_APP+34;
+constexpr UINT CompositionQuery=WM_APP+36;
 
 void NavigationFeedback(NavigationCode code) {
   NOTIFYICONDATAW icon{sizeof(icon)};
@@ -565,6 +570,8 @@ std::wstring Status(const Session &s) {
 void DrawIndicator(SessionState state, float x, float y,
                    ID2D1SolidColorBrush *brush, ID2D1RenderTarget *canvas = nullptr) {
   if (!canvas) canvas = target.Get();
+  ComPtr<ID2D1Factory> graphics;
+  canvas->GetFactory(&graphics);
   const auto tone = StateTone(state);
   brush->SetColor(D2D1::ColorF(tone.fill));
   if (state == SessionState::Offline) {
@@ -575,14 +582,14 @@ void DrawIndicator(SessionState state, float x, float y,
   }
   canvas->FillEllipse(D2D1::Ellipse(D2D1::Point2F(x, y), 7.5f, 7.5f), brush);
   brush->SetColor(D2D1::ColorF(tone.ink));
-  const auto rounded=RoundStatusStroke(factory.Get());
+  const auto rounded=RoundStatusStroke(graphics.Get());
   auto line = [&](float x1, float y1, float x2, float y2) {
     canvas->DrawLine(D2D1::Point2F(x + x1 * 1.6f, y + y1 * 1.6f),
                      D2D1::Point2F(x + x2 * 1.6f, y + y2 * 1.6f), brush,
                      1.5f,rounded);
   };
   if (state == SessionState::Completed) {
-    DrawCheckMark(canvas,factory.Get(),brush,x,y,1.6f,1.5f);
+    DrawCheckMark(canvas,graphics.Get(),brush,x,y,1.6f,1.5f);
   } else if (state == SessionState::Error) {
     line(-1.5f, -1.5f, 1.5f, 1.5f);
     line(-1.5f, 1.5f, 1.5f, -1.5f);
@@ -602,7 +609,7 @@ void DrawIndicator(SessionState state, float x, float y,
     };
     ComPtr<ID2D1PathGeometry> arc;
     ComPtr<ID2D1GeometrySink> sink;
-    if (SUCCEEDED(factory->CreatePathGeometry(&arc)) &&
+    if (SUCCEEDED(graphics->CreatePathGeometry(&arc)) &&
         SUCCEEDED(arc->Open(&sink))) {
       sink->BeginFigure(point(angle), D2D1_FIGURE_BEGIN_HOLLOW);
       sink->AddArc(D2D1::ArcSegment(
@@ -666,12 +673,15 @@ PanelScene CapturePanelScene(float width, float height) {
          stateMotion.Offset(session, animationNow),
          InteractionOpacity(panel, FeedbackKey(session)),
          i + 1 < snapshot.sessions.size() && y + RowHeight < height});
+    scene.rows.back().identity=FeedbackKey(session);
   }
   return scene;
 }
 void DrawPanelScene(ID2D1RenderTarget *canvas, const PanelScene &scene,
                     bool dynamic) {
   const auto ink = D2D1::ColorF(PetTheme::Ink);
+  ComPtr<ID2D1Factory> graphics;
+  canvas->GetFactory(&graphics);
   if (!dynamic)
     PetTheme::PaintSurface(canvas, scene.width, scene.height, scene.material,
                            8.f, false);
@@ -711,11 +721,15 @@ void DrawPanelScene(ID2D1RenderTarget *canvas, const PanelScene &scene,
     if (item.state != SessionState::Running)
       DrawIndicator(item.state, RowIndicatorCenter, y + 17 + hop, brush.Get(),
                     canvas);
+    else {
+      brush->SetColor(D2D1::ColorF(PetTheme::Running.fill));
+      canvas->FillEllipse(D2D1::Ellipse(D2D1::Point2F(RowIndicatorCenter,y+17+hop),7.5f,7.5f),brush.Get());
+    }
     const auto tone = StateTone(item.state);
     const auto badge =
         D2D1::RectF(row.badgeLeft, y + 6 + hop, row.badgeRight, y + 28 + hop);
     const bool badgeDrawn =
-        DrawStatusBadge(canvas, factory.Get(), writeFactory.Get(), item.status,
+        DrawStatusBadge(canvas, graphics.Get(), writeFactory.Get(), item.status,
                         badge, D2D1::ColorF(tone.fill), D2D1::ColorF(tone.ink));
     if (!badgeDrawn) {
       brush->SetColor(D2D1::ColorF(tone.fill));
@@ -770,6 +784,24 @@ bool PreparePanelTexture(const PanelScene &scene, D2D1_SIZE_U pixels) {
   ++panelCacheBuilds;
   return true;
 }
+bool UpdatePanelComposition(const PanelScene &scene) {
+  if (gpuProfileLegacy || !panelComposition.Ensure(panel)) return false;
+  std::vector<ComposedSession> rows;
+  for (const auto &item:scene.rows) {
+    if (item.state!=SessionState::Running) continue;
+    const auto row=LayoutRow(scene.width,MeasureTextWidth(item.age,SessionTextSize,true),
+                             MeasureTextWidth(item.status,11.5f));
+    const float width=row.titleRight-row.titleLeft;
+    auto layout=LayoutText({item.title,width,RowHeight,SessionTextSize,true,false,false,false});
+    DWRITE_TEXT_METRICS metrics{};
+    const float span=layout.layout && SUCCEEDED(layout.layout->GetMetrics(&metrics))
+        ? std::min(width,metrics.widthIncludingTrailingWhitespace) : width;
+    rows.push_back({item.identity,item.title,layout.layout,row.titleLeft,item.y,width,
+                    RowHeight,layout.offset,span,item.y+17+item.hop});
+  }
+  return SUCCEEDED(panelComposition.Update(rows,scene.width,scene.height,scene.dpi,
+                                            !gpuProfileNoShimmer,!gpuProfileNoSpinner));
+}
 void PaintPanel() {
   ++panelDraws;
   PAINTSTRUCT ps;
@@ -777,11 +809,23 @@ void PaintPanel() {
   RECT rc;
   GetClientRect(panel, &rc);
   const auto pixels = D2D1::SizeU(rc.right, rc.bottom);
+  const auto scene=CapturePanelScene(rc.right/dpi,rc.bottom/dpi);
+  if (UpdatePanelComposition(scene)) {
+    target.Reset();panelTexture.Reset();
+    if (!lastPanelScene || *lastPanelScene!=scene)
+      panelDrawResult=panelComposition.PaintBase(scene.width,scene.height,scene.dpi,
+          [&](ID2D1RenderTarget *canvas) { DrawPanelScene(canvas,scene,false); });
+    if (SUCCEEDED(panelDrawResult)) {
+      lastPanelScene=scene;
+      EndPaint(panel,&ps);
+      return;
+    }
+    ++panelDrawErrors;
+  }
   if (!target) {
     UiRenderer::Create(factory.Get(), panel, 96 * dpi, pixels, &target);
   }
   if (target) {
-    const auto scene = CapturePanelScene(rc.right / dpi, rc.bottom / dpi);
     const bool cached = PreparePanelTexture(scene, pixels);
     target->BeginDraw();
     if (cached) {
@@ -795,6 +839,7 @@ void PaintPanel() {
     }
     DrawPanelScene(target.Get(), scene, true);
     panelDrawResult = target->EndDraw();
+    if (SUCCEEDED(panelDrawResult)) lastPanelScene=scene;
     if (FAILED(panelDrawResult))
       ++panelDrawErrors;
     if (panelDrawResult == D2DERR_RECREATE_TARGET) {
@@ -1155,12 +1200,14 @@ bool TickPanel(bool visualFrame = false) {
   static std::vector<std::wstring> previousAges;
   static PanelFramePolicy frames;
   if (!IsWindowVisible(panel)) {
+    panelComposition.Suspend();
+    lastPanelScene.reset();
     frames.hadMotion = false;
     RequestContinuousFrames(false);
     return false;
   }
-  // State observation stays at two seconds; visual time and the loading arc
-  // follow their own UI cadence and always use elapsed time, never tick counts.
+  // Repeating animations belong to the system compositor. The UI frame clock
+  // is needed only for a finite hop or the compatibility renderer.
   std::vector<std::wstring> ages;
   bool loading = false;
   bool transitioning = false;
@@ -1176,7 +1223,7 @@ bool TickPanel(bool visualFrame = false) {
   }
   // 动画由垂直同步独占重绘，避免 100 ms 定时器叠加成 120 + 10 Hz。
   // Keep one final resting frame pending until the visual clock consumes it.
-  const bool moving = loading || transitioning;
+  const bool moving = (loading && !panelComposition.Ready()) || transitioning;
   if (frames.Tick(moving, ages != previousAges, visualFrame)) {
     InvalidateRect(panel, nullptr, FALSE);
     previousAges = std::move(ages);
@@ -1449,7 +1496,12 @@ void ExecuteToolbarAction(int id) {
 void Menu() { ShowToolbar(); }
 LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   switch (msg) {
+  case WM_SHOWWINDOW:
+    if (!w) { panelComposition.Suspend();lastPanelScene.reset(); }
+    break;
   case PopupBackendQuery:
+    if (panelComposition.Ready())
+      return w==1 ? (LRESULT)std::lround(96*dpi*100) : D2D1_RENDER_TARGET_TYPE_HARDWARE;
     if (w==1 && target) { float x,y; target->GetDpi(&x,&y); return (LRESULT)std::lround(x*100); }
     return target ? UiRenderer::Backend(h) : -1;
   case WM_TIMER:
@@ -1465,6 +1517,7 @@ LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   case BackdropChanged:
     ApplySurfaceMaterial(h);
     panelTexture.Reset();
+    lastPanelScene.reset();
     InvalidateRect(h, nullptr, FALSE);
     return 0;
 
@@ -1549,6 +1602,8 @@ LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 }
 LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   switch (msg) {
+  case CompositionQuery:
+    return panelComposition.Metric((unsigned)w);
   case GpuRenderQuery:
     if (w == 4)
       return (LRESULT)std::llround(VisualClockMs() * 1000);
@@ -1727,14 +1782,15 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
         incomingNotices.push_back(session);
       for (auto &notice : notices)
         if (!notice->closing) {
-          const auto previousTitle = notice->record.Title();
+          const auto previousTitle = notice->record.Title(),previousDetail=notice->record.Detail();
           if (!notice->record.Sync(pending))
             CloseNotice(notice->window);
           else {
             if (previousTitle != notice->record.Title())
               SetWindowTextW(notice->window,
                              NoticeCaption(notice->record).c_str());
-            InvalidateRect(notice->window, nullptr, FALSE);
+            if (previousTitle!=notice->record.Title() || previousDetail!=notice->record.Detail())
+              InvalidateRect(notice->window, nullptr, FALSE);
           }
         }
       if (snapshot.online && pending.online)
@@ -1777,8 +1833,13 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     }
     ShowIncomingNotices();
     UpdateAnimation();
-    if (!TickPanel())
-      InvalidateRect(panel, nullptr, FALSE);
+    if (!TickPanel() && IsWindowVisible(panel)) {
+      RECT bounds{};
+      GetClientRect(panel,&bounds);
+      const auto scene=CapturePanelScene(bounds.right/dpi,bounds.bottom/dpi);
+      if (!lastPanelScene || *lastPanelScene!=scene)
+        InvalidateRect(panel,nullptr,FALSE);
+    }
     return 0;
   }
   case WM_DESTROY:
@@ -1795,6 +1856,7 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   return DefWindowProcW(h, msg, w, l);
 }
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
+  if (wcsstr(command,L"--composition-test")) return PanelCompositionTests() ? 0 : 1;
   if (wcsstr(command,L"--panel-scene-test")) return PanelSceneTests() ? 0 : 1;
   instance = inst;
   wchar_t path[32768];
@@ -2006,6 +2068,14 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
       << " backdropType=" << SendMessageW(character,GpuRenderQuery,9,0) << "\n";
     f << "panelDrawResult=" << SendMessageW(character,GpuRenderQuery,10,0)
       << " panelDrawErrors=" << SendMessageW(character,GpuRenderQuery,11,0) << "\n";
+    f << "compositionReady=" << SendMessageW(character,CompositionQuery,0,0)
+      << " compositionResult=" << SendMessageW(character,CompositionQuery,1,0)
+      << " compositionUploads=" << SendMessageW(character,CompositionQuery,2,0)
+      << " compositionStarts=" << SendMessageW(character,CompositionQuery,3,0)
+      << " compositionUpdates=" << SendMessageW(character,CompositionQuery,4,0)
+      << " compositionRows=" << SendMessageW(character,CompositionQuery,5,0)
+      << " compositionFailures=" << SendMessageW(character,CompositionQuery,6,0) << "\n";
+    f << "compositionBaseDraws=" << SendMessageW(character,CompositionQuery,7,0) << "\n";
     return s.error.empty() ? 0 : 2;
   }
   if (wcsstr(command, L"--quit")) {
@@ -2026,6 +2096,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
     gpuProfileNoSpinner=gpuProfileScene.find(L"no-spinner")!=std::wstring::npos;
     gpuProfileNoCache=gpuProfileScene.find(L"no-cache")!=std::wstring::npos;
     gpuProfileNoMask=gpuProfileScene.find(L"no-mask")!=std::wstring::npos;
+    gpuProfileLegacy=gpuProfileScene.find(L"legacy")!=std::wstring::npos;
   }
   preview = wcsstr(command, L"--preview") != nullptr;
   navigationPreview =
@@ -2236,6 +2307,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   worker.join();
   StopSessionNavigation();
   StopFrameClock();
+  panelComposition.Shutdown();
   DestroyToolbar();
   ClearPopupAnimations();
   ClearAllInteractionFeedback();
@@ -2248,9 +2320,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   DestroyWindow(panel);
   animation.reset();
   petCanvas.Reset();
+  panelTexture.Reset();
   target.Reset();
   writeFactory.Reset();
   factory.Reset();
+  panelComposition.FinishThread();
   Gdiplus::GdiplusShutdown(gdip);
   CoUninitialize();
   CloseHandle(singleton);

@@ -103,6 +103,11 @@ try {
       CacheFallbacks=($after.panelCacheFallbacks-$before.panelCacheFallbacks);
       BackdropMode=$after.backdropMode; BackdropType=$after.backdropType;
       PanelDrawErrors=$after.panelDrawErrors-$before.panelDrawErrors;
+      CompositionReady=$after.compositionReady;
+      CompositionFailures=$after.compositionFailures;
+      CompositionUploadsPerSecond=($after.compositionUploads-$before.compositionUploads)/$renderElapsed;
+      CompositionStarts=$after.compositionStarts-$before.compositionStarts;
+      CompositionBaseDrawsPerSecond=($after.compositionBaseDraws-$before.compositionBaseDraws)/$renderElapsed;
       DedicatedMiB=($memory | Measure-Object DedicatedUsage -Sum).Sum/1MB;
       SharedMiB=($memory | Measure-Object SharedUsage -Sum).Sum/1MB;
       BoardUtilizationPercent=[double]$hardware[0]; BoardPowerWatts=[double]$hardware[1]; BoardGraphicsClockMHz=[double]$hardware[2];

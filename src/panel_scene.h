@@ -9,6 +9,7 @@ struct PanelVisualRow {
   SessionState state{};
   float y = 0, hop = 0, feedback = 0;
   bool divider = false;
+  std::wstring identity;
   bool operator==(const PanelVisualRow &) const = default;
 };
 struct PanelScene {
@@ -34,6 +35,7 @@ inline bool PanelSceneTests() {
   };
   return changed([](auto &s) { s.rows[0].age = L"1m"; }) &&
          changed([](auto &s) { s.rows[0].title = L"重命名"; }) &&
+         changed([](auto &s) { s.rows[0].identity = L"another-session"; }) &&
          changed([](auto &s) { s.rows[0].state = SessionState::Completed; }) &&
          changed([](auto &s) { s.rows[0].feedback = .16f; }) &&
          changed([](auto &s) { s.rows[0].hop = -2; }) &&
