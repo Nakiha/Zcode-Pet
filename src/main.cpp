@@ -19,6 +19,7 @@
 #include "panel_scene.h"
 #include "text_mask.h"
 #include "panel_composition.h"
+#include "resource.h"
 #include <deque>
 #include <chrono>
 #include <cmath>
@@ -40,6 +41,9 @@ using Microsoft::WRL::ComPtr;
 namespace fs = std::filesystem;
 HINSTANCE instance;
 HWND pet, panel;
+HICON trayIcon=nullptr;
+bool trayRegistered=false,trayVersion4=false,trayIconOwned=false;
+UINT taskbarCreatedMessage=RegisterWindowMessageW(L"TaskbarCreated");
 HRESULT panelMaterialResult = E_PENDING;
 HRESULT panelDrawResult = S_OK;
 uint64_t panelDrawErrors = 0;
@@ -168,6 +172,34 @@ constexpr UINT Refresh = WM_APP + 1, Tray = WM_APP + 2,
                NavigationCompleted = WM_APP + 30, NavigationQuery = WM_APP + 31,
                NoticeInfoQuery=WM_APP+32,GpuRenderQuery=WM_APP+34;
 constexpr UINT CompositionQuery=WM_APP+36;
+constexpr UINT TrayInfoQuery=WM_APP+38;
+void UpdateTrayIcon(bool reload=false) {
+  HICON previous=trayIcon;
+  const bool previousOwned=trayIconOwned;
+  if (!trayIcon || reload) {
+    const auto trayDpi=GetDpiForWindow(pet);
+    trayIcon=(HICON)LoadImageW(instance,MAKEINTRESOURCEW(IDI_ZCODEPET),IMAGE_ICON,
+        GetSystemMetricsForDpi(SM_CXSMICON,trayDpi),GetSystemMetricsForDpi(SM_CYSMICON,trayDpi),0);
+    trayIconOwned=trayIcon!=nullptr;
+    if (!trayIcon) trayIcon=LoadIconW(instance,MAKEINTRESOURCEW(IDI_ZCODEPET));
+  }
+  NOTIFYICONDATAW icon{sizeof(icon)};
+  icon.hWnd=pet;icon.uID=1;
+  icon.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP|NIF_SHOWTIP;
+  icon.uCallbackMessage=Tray;icon.hIcon=trayIcon;
+  wcscpy_s(icon.szTip,L"ZCode Pet · 只读状态观察");
+  bool added=!trayRegistered;
+  trayRegistered=Shell_NotifyIconW(added ? NIM_ADD : NIM_MODIFY,&icon)!=FALSE;
+  if (!trayRegistered && !added) {
+    trayRegistered=Shell_NotifyIconW(NIM_ADD,&icon)!=FALSE;
+    added=true;
+  }
+  if (trayRegistered && added) {
+    icon.uVersion=NOTIFYICON_VERSION_4;
+    trayVersion4=Shell_NotifyIconW(NIM_SETVERSION,&icon)!=FALSE;
+  }
+  if (previous && previous!=trayIcon && previousOwned) DestroyIcon(previous);
+}
 
 void NavigationFeedback(NavigationCode code) {
   NOTIFYICONDATAW icon{sizeof(icon)};
@@ -1601,7 +1633,12 @@ LRESULT CALLBACK PanelProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   return DefWindowProcW(h, msg, w, l);
 }
 LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
+  if (taskbarCreatedMessage && msg==taskbarCreatedMessage) {
+    trayRegistered=false;UpdateTrayIcon();return 0;
+  }
   switch (msg) {
+  case TrayInfoQuery:
+    return w==0 ? trayRegistered : w==1 ? trayIcon!=nullptr : trayVersion4;
   case CompositionQuery:
     return panelComposition.Metric((unsigned)w);
   case GpuRenderQuery:
@@ -1743,6 +1780,7 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     }
     return 0;
   case WM_DPICHANGED:
+    UpdateTrayIcon(true);
     DrawPet();
     ReflowPopups();
     SetFrameClockMonitor(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST));
@@ -1763,9 +1801,10 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     Menu();
     return 0;
   case Tray:
-    if (l == WM_LBUTTONUP)
+    if ((trayVersion4 && (LOWORD(l)==NIN_SELECT || LOWORD(l)==NIN_KEYSELECT)) ||
+        (!trayVersion4 && l==WM_LBUTTONUP))
       TogglePanel();
-    if (l == WM_RBUTTONUP)
+    if ((trayVersion4 && LOWORD(l)==WM_CONTEXTMENU) || (!trayVersion4 && l==WM_RBUTTONUP))
       Menu();
     return 0;
   case Refresh: {
@@ -1849,6 +1888,9 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
       n.hWnd = h;
       n.uID = 1;
       Shell_NotifyIconW(NIM_DELETE, &n);
+      trayRegistered=false;
+      if (trayIconOwned && trayIcon) DestroyIcon(trayIcon);
+      trayIcon=nullptr;trayIconOwned=false;
     }
     PostQuitMessage(0);
     return 0;
@@ -2076,6 +2118,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
       << " compositionRows=" << SendMessageW(character,CompositionQuery,5,0)
       << " compositionFailures=" << SendMessageW(character,CompositionQuery,6,0) << "\n";
     f << "compositionBaseDraws=" << SendMessageW(character,CompositionQuery,7,0) << "\n";
+    f << "trayRegistered=" << SendMessageW(character,TrayInfoQuery,0,0)
+      << " trayIconLoaded=" << SendMessageW(character,TrayInfoQuery,1,0)
+      << " trayVersion4=" << SendMessageW(character,TrayInfoQuery,2,0) << "\n";
     return s.error.empty() ? 0 : 2;
   }
   if (wcsstr(command, L"--quit")) {
@@ -2126,6 +2171,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
     return 3;
   WNDCLASSW wc{};
   wc.hInstance = inst;
+  wc.hIcon=LoadIconW(inst,MAKEINTRESOURCEW(IDI_ZCODEPET));
   wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
   wc.lpfnWndProc = PetProc;
   wc.lpszClassName = L"ZCodePet.Native";
@@ -2160,14 +2206,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   ApplySurfaceMaterial(panel);
   InitToolbar(pet, factory.Get(), writeFactory.Get(), ToolbarValues,
               ExecuteToolbarAction, ApplySurfaceMaterial, ToolbarObstacles, preview);
-  NOTIFYICONDATAW n{sizeof(n)};
-  n.hWnd = pet;
-  n.uID = 1;
-  n.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-  n.uCallbackMessage = Tray;
-  n.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-  wcscpy_s(n.szTip, L"ZCode Pet · 只读状态观察");
-  Shell_NotifyIconW(NIM_ADD, &n);
+  UpdateTrayIcon();
   SetAnimation(L"idle");
   if (!animation) {
     MessageBoxW(nullptr, L"缺少 assets/idle.gif，请保持素材目录和 EXE 在一起。",
