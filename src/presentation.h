@@ -171,7 +171,7 @@ inline const wchar_t *SelectPetAnimation(bool running, bool success,
                                          bool dragging, bool waiting = false) {
   if (waiting)
     return L"waiting";
-  return running    ? L"thinking"
+  return running    ? L"working"
          : success  ? L"success"
          : failed   ? L"paused"
          : dragging ? L"paused"
@@ -288,7 +288,7 @@ inline bool PresentationTests() {
   if (CompactPreview(L"**完成**\n\n说明") != L"完成 说明")
     return false;
   if (std::wstring(SelectPetAnimation(true, true, false, true, false)) !=
-          L"thinking" ||
+          L"working" ||
       std::wstring(SelectPetAnimation(false, true, false, false, false)) !=
           L"success" ||
       std::wstring(SelectPetAnimation(false, false, true, false, false)) !=
