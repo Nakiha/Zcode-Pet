@@ -13,7 +13,8 @@ namespace {
 std::mutex mutex;
 std::condition_variable ready;
 std::thread worker;
-std::optional<Session> request;
+struct NavigationRequest { Session session; std::vector<Session> peers; };
+std::optional<NavigationRequest> request;
 std::optional<NavigationResult> completed;
 NavigationResult last;
 std::atomic_bool stopping{false}, busy{false};
@@ -164,10 +165,15 @@ ComPtr<IUIAutomationElement> ListRow(IUIAutomation *uia,
   return {};
 }
 bool ContainsTitle(IUIAutomation *uia, IUIAutomationElement *row,
-                   const std::wstring &title) {
-  auto condition = Property(uia, UIA_NamePropertyId, title);
-  auto items = FindAll(row, TreeScope_Descendants, condition.Get());
-  return !items.empty();
+                   const Session &session, const std::vector<Session> &peers) {
+  if (AccessibleSessionName(Name(row), session, peers))
+    return true;
+  ComPtr<IUIAutomationCondition> any;
+  uia->CreateTrueCondition(&any);
+  for (const auto &child : FindAll(row, TreeScope_Descendants, any.Get()))
+    if (AccessibleSessionName(Name(child.Get()), session, peers))
+      return true;
+  return false;
 }
 bool Foreground(HWND window) {
   return GetAncestor(GetForegroundWindow(), GA_ROOT) == window;
@@ -185,7 +191,7 @@ bool Activate(HWND window) {
   }
   return false;
 }
-NavigationResult Open(IUIAutomation *uia, const Session &session) {
+NavigationResult Open(IUIAutomation *uia, const Session &session, const std::vector<Session> &peers) {
   if (!uia)
     return {NavigationCode::AutomationFailed};
   const auto deadline = GetTickCount64() + 6000;
@@ -193,7 +199,9 @@ NavigationResult Open(IUIAutomation *uia, const Session &session) {
   scanWindows = (int)windows.size();
   if (windows.empty())
     return {NavigationCode::AppClosed};
-  auto title = Property(uia, UIA_NamePropertyId, session.title);
+  ComPtr<IUIAutomationCondition> title;
+  VARIANT rowType{}; rowType.vt = VT_I4; rowType.lVal = UIA_ListItemControlTypeId;
+  uia->CreatePropertyCondition(UIA_ControlTypePropertyId, rowType, &title);
   if (!title)
     return {NavigationCode::AutomationFailed};
   struct Match {
@@ -210,11 +218,14 @@ NavigationResult Open(IUIAutomation *uia, const Session &session) {
       continue;
     for (const auto &text :
          FindAll(root.Get(), TreeScope_Descendants, title.Get())) {
+      if (stopping || GetTickCount64() > deadline)
+        return {NavigationCode::Cancelled};
       ++scanTitles;
       auto row = ListRow(uia, text.Get());
       if (row)
         ++scanRows;
-      if (!row || !InProject(uia, row.Get(), project))
+      if (!row || !InProject(uia, row.Get(), project) ||
+          !ContainsTitle(uia, row.Get(), session, peers))
         continue;
       bool duplicate = false;
       for (const auto &match : matches) {
@@ -228,7 +239,7 @@ NavigationResult Open(IUIAutomation *uia, const Session &session) {
   }
   const int count = (int)matches.size();
   if (count != 1)
-    return {count ? NavigationCode::Ambiguous : NavigationCode::NotVisible,
+    return {count ? NavigationCode::Ambiguous : NavigationCode::NotFound,
             count};
   auto &match = matches.front();
   if (stopping || GetTickCount64() > deadline)
@@ -236,12 +247,16 @@ NavigationResult Open(IUIAutomation *uia, const Session &session) {
   if (!Activate(match.window))
     return {NavigationCode::FocusFailed, count};
   BOOL enabled = FALSE, offscreen = TRUE;
-  match.row->get_CurrentIsEnabled(&enabled);
-  match.row->get_CurrentIsOffscreen(&offscreen);
-  if (!enabled || offscreen ||
-      !ContainsTitle(uia, match.row.Get(), session.title) ||
+  if (FAILED(match.row->get_CurrentIsEnabled(&enabled)) ||
+      FAILED(match.row->get_CurrentIsOffscreen(&offscreen)))
+    return {NavigationCode::AutomationFailed, count};
+  if (offscreen)
+    return {NavigationCode::Offscreen, count};
+  if (!enabled)
+    return {NavigationCode::AutomationFailed, count};
+  if (!ContainsTitle(uia, match.row.Get(), session, peers) ||
       !InProject(uia, match.row.Get(), project))
-    return {NavigationCode::NotVisible, count};
+    return {NavigationCode::NotFound, count};
   if (stopping || !Foreground(match.window))
     return {NavigationCode::FocusFailed, count};
   ComPtr<IUIAutomationInvokePattern> invoke;
@@ -311,13 +326,13 @@ void StartSessionNavigation(HWND target, UINT message) {
         settings->put_TransactionTimeout(1000);
       }
       for (;;) {
-        Session session;
+        NavigationRequest selected;
         {
           std::unique_lock lock(mutex);
           ready.wait(lock, [] { return stopping || request.has_value(); });
           if (stopping)
             break;
-          session = std::move(*request);
+          selected = std::move(*request);
           request.reset();
         }
         NavigationResult result;
@@ -327,7 +342,7 @@ void StartSessionNavigation(HWND target, UINT message) {
         scanProjectNames = 0;
         scanProjectType = 0;
         try {
-          result = Open(uia.Get(), session);
+          result = Open(uia.Get(), selected.session, selected.peers);
         } catch (...) {
           result.code = NavigationCode::AutomationFailed;
         }
@@ -355,13 +370,13 @@ void StopSessionNavigation() {
   completed.reset();
   busy = false;
 }
-bool NavigateToSession(const Session &session) {
+bool NavigateToSession(const Session &session, const std::vector<Session> &peers) {
   std::lock_guard lock(mutex);
   if (stopping || busy || !worker.joinable())
     return false;
   busy = true;
   last = {NavigationCode::Busy};
-  request = session;
+  request = NavigationRequest{session, peers};
   ready.notify_one();
   return true;
 }

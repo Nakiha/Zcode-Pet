@@ -13,7 +13,8 @@ enum class NavigationCode {
   Missing,
   Ambiguous,
   AppClosed,
-  NotVisible,
+  NotFound,
+  Offscreen,
   AutomationFailed,
   FocusFailed,
   Cancelled
@@ -39,6 +40,34 @@ inline bool SameProject(const std::wstring &a, const std::wstring &b) {
   return std::equal(a.begin(), a.end(), b.begin(), [](wchar_t x, wchar_t y) {
     return towlower(x) == towlower(y);
   });
+}
+inline bool AccessibleSessionName(const std::wstring &name, const Session &target,
+                                  const std::vector<Session> &peers) {
+  if (target.title.empty() || !name.starts_with(target.title))
+    return false;
+  if (name == target.title)
+    return true;
+  for (const auto &peer : peers)
+    if (SameProject(ProjectName(peer.path), ProjectName(target.path)) &&
+        peer.title.size() > target.title.size() && name.starts_with(peer.title))
+      return false;
+  auto suffix = name.substr(target.title.size());
+  suffix.erase(std::remove_if(suffix.begin(), suffix.end(),
+                             [](wchar_t c) { return iswspace(c); }), suffix.end());
+  if (suffix == L"刚刚" || suffix == L"justnow")
+    return true;
+  size_t digits = 0;
+  while (digits < suffix.size() && suffix[digits] >= L'0' && suffix[digits] <= L'9')
+    ++digits;
+  if (!digits || digits > 6)
+    return false;
+  const auto unit = suffix.substr(digits);
+  for (const auto *allowed : {L"秒", L"秒前", L"分", L"分钟前", L"分钟", L"小时",
+                              L"小时前", L"天", L"天前", L"周", L"周前", L"个月",
+                              L"个月前", L"年", L"年前", L"s", L"m", L"h", L"d"})
+    if (unit == allowed)
+      return true;
+  return false;
 }
 struct NavigationPreparation {
   NavigationCode code;
@@ -69,6 +98,18 @@ inline int SessionRowAt(float y, float height, int scroll, size_t count) {
   return row >= 0 && (size_t)row < count ? row : -1;
 }
 inline bool NavigationModelTests() {
+  Session named;
+  named.title = L"字节266";
+  named.path = L"C:/Project";
+  auto longer = named;
+  longer.title = L"字节2662";
+  if (!AccessibleSessionName(L"字节2662分", named, {}) ||
+      !AccessibleSessionName(L"字节266    2 分", named, {}) ||
+      !AccessibleSessionName(L"字节266", named, {}) ||
+      AccessibleSessionName(L"字节266其他任务", named, {}) ||
+      AccessibleSessionName(L"字节2662分", named, {longer}) ||
+      !AccessibleSessionName(L"字节26622分", longer, {named}))
+    return false;
   Session a;
   a.id = L"a";
   a.workspace = L"wa";

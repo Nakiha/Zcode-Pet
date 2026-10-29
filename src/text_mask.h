@@ -1,3 +1,4 @@
+#include "text_raster.h"
 #pragma once
 #include <d2d1.h>
 #include <dwrite.h>
@@ -53,8 +54,8 @@ inline bool PaintTextMask(ID2D1RenderTarget *canvas, IDWriteTextLayout *layout,
   surface->BeginDraw();
   surface->Clear(D2D1::ColorF(0, 0.f));
   surface->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-  surface->DrawTextLayout(D2D1::Point2F(x - left, originY - top), layout,
-                          white.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+  surface->DrawTextLayout(TextRasterOrigin(surface.Get(), x - left, originY - top), layout,
+                          white.Get(), StableTextOptions);
   Entry entry{
       canvas,  layout,
       {},      x,

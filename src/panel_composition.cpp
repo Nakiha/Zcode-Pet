@@ -1,3 +1,4 @@
+#include "text_raster.h"
 #include "panel_composition.h"
 #include "composition_device.h"
 #include "theme.h"
@@ -147,9 +148,9 @@ struct PanelComposition::Impl {
               D2D1::RectF(x, y, x + row.width, y + row.height),
               D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
           canvas->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-          canvas->DrawTextLayout(D2D1::Point2F(x, y + row.textOffset),
+          canvas->DrawTextLayout(TextRasterOrigin(canvas, x, y + row.textOffset),
                                  row.layout.Get(), white.Get(),
-                                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                                 StableTextOptions);
           canvas->PopAxisAlignedClip();
         });
     auto gradient = compositor.CreateLinearGradientBrush();

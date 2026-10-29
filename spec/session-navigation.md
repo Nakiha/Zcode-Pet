@@ -62,3 +62,7 @@ Main 只负责协议校验、窗口路由及投递；Renderer/现有 session own
 - 未逐一验收不同 ZCode 版本、多窗口、最小化、权限等级不一致及所有回退动作；这些场景可能明确失败。UIA 动作返回成功只表示动作已提交，不承诺页面异步加载已经完成。
 
 参考：[Microsoft UIA 元素查找](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-obtainingelements)、[UIA 控件模式](https://learn.microsoft.com/en-us/windows/win32/winauto/uiauto-controlpatternsoverview)。
+
+## 合并名称兼容
+
+UIA 侧栏行名称可为完整标题加时间（如“字节2662分”）。保留完整标题精确匹配，额外接受明确的时间后缀；不删除标题内部空格，也不接受任意字符串前缀。使用点击时同项目的已知会话名称排除更长前缀候选，标题重名、跨窗口重复仍拒绝歧义。激活前重新验证名称与项目。已知列表不是应用的全部历史，未观察到的标题仍可能导致无法完全判断；不以模糊匹配强行导航。

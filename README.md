@@ -19,7 +19,7 @@ Windows 11 x64，目标最低系统版本 26200.8875。解压便携包，保持 
 - 右键工具栏可调整宠物大小、面板缩放、文字显示、背景材质，或查看素材署名与许可。
 - 背景支持实时亚克力、仅取壁纸的 Mica、纯色；系统不支持透明材质时使用实色。浮层共用 DPI、屏幕边距和避让规则。
 - 完成/等待提醒保留到手动关闭；开始新一轮时清理对应旧提醒。多个会话各自保留提醒，关闭后其余气泡平滑补位。悬停显示左上角关闭按钮，正文、行和按钮均有 hover / press 反馈。
-- 点击会话行或提醒正文，通过 Windows UI Automation 打开 ZCode 中唯一匹配的已有会话，不发送消息。重名、折叠、筛选或无法聚焦时提示失败，不使用模糊匹配或坐标猜选。[导航限制](spec/session-navigation.md)
+- 点击会话行或提醒正文，通过 Windows UI Automation 打开 ZCode 中唯一匹配的已有会话，不发送消息。重名、折叠、筛选或无法聚焦时提示失败，兼容完整标题后附时间的名称，并在同项目已知标题间做最长前缀消歧；不接受任意后缀或坐标猜选。[导航限制](spec/session-navigation.md)
 - EXE、窗口和托盘均内嵌多尺寸图标，支持 DPI 缩放与 Explorer 重启恢复。
 
 ## Spine 动画与渲染
@@ -72,3 +72,7 @@ Spine 角色资源由用户提供的 `Q版蕾米.zip` 导出，原包没有单�
 **Spine runtime 不是 MIT 或宽松许可证。** 使用与分发须遵守随附的完整官方协议；若无适用 Spine Editor 许可覆盖，协议要求每个产品使用者自行取得 Spine Editor 许可。详见 [官方运行时许可](https://esotericsoftware.com/spine-runtimes-license)、`third_party/spine-cpp/LICENSE` 和 `assets/spine/SPINE-RUNTIME-LICENSE.txt`。
 
 JSON 解析使用 nlohmann/json 3.11.3（MIT），完整许可位于 `third_party/json.LICENSE`。其余系统图形、数据库与 UI Automation 组件来自 Windows。
+
+灰度正文与扫光遮罩使用固定物理像素原点，并关闭 DirectWrite 的二次基线吸附，减少合成表面重绘时的基线跳变。低分辨率屏幕的实际视觉效果仍需设备复核。
+
+日志缺少当前 turn 证据时，只读 cli/db/db.sqlite 的最新 assistant 消息作为推断运行态兜底：检查 finish、完成时间及该消息中未结束的 running part，过滤当前 ZCode 进程启动前的遗留证据和明确已结束回合。数据库不可用不覆盖日志。推断无法保证识别所有异常中断。导航分别提示“找不到条目”和“条目离屏”；虚拟列表未挂载的条目只能归为找不到。

@@ -149,13 +149,57 @@ void ReadQuestionsFromDb(Sqlite &sql, Snapshot &snapshot) {
   }
   sql.finalize(stmt);
 }
-void ReadCurrentQuestions(const fs::path &root, Snapshot &snapshot) {
+void ReadRunningFallback(Sqlite &sql, Snapshot &snapshot, int64_t processStart) {
+  if (!snapshot.online || !processStart || !sql.bind)
+    return;
+  const char *query = R"SQL(SELECT m.id,json_extract(m.data,'$.anchor.turnId'),
+ m.time_created,coalesce(json_extract(m.data,'$.finish'),''),
+ coalesce(json_extract(m.data,'$.time.completed'),0),
+ coalesce((SELECT max(p.time_updated) FROM part p
+ WHERE p.message_id=m.id AND p.session_id=m.session_id
+ AND json_extract(p.data,'$.state.status')='running'
+ AND coalesce(json_extract(p.data,'$.state.time.end'),json_extract(p.data,'$.time.end'),0)=0),0)
+ FROM message m WHERE m.session_id=?1 AND json_extract(m.data,'$.role')='assistant'
+ AND NOT EXISTS(SELECT 1 FROM message u WHERE u.session_id=m.session_id
+ AND json_extract(u.data,'$.role')='user' AND u.sequence>m.sequence)
+ ORDER BY m.sequence DESC,m.time_created DESC LIMIT 1)SQL";
+  for (auto &session : snapshot.sessions) {
+    if (session.running || session.waiting ||
+        std::count_if(snapshot.sessions.begin(), snapshot.sessions.end(),
+                      [&](const auto &other) { return other.id == session.id; }) != 1)
+      continue;
+    void *stmt = nullptr;
+    if (sql.prepare(sql.db, query, -1, &stmt, nullptr) != 0)
+      return; // Optional/schema-incompatible database never overrides log evidence.
+    const auto id = Utf8(session.id);
+    if (sql.bind(stmt, 1, id.c_str(), -1, nullptr) == 0 && sql.step(stmt) == 100) {
+      const auto turn = sql.text(stmt, 1), finish = sql.text(stmt, 3);
+      const auto created = sql.integer(stmt, 2), completed = sql.integer(stmt, 4),
+                 partUpdated = sql.integer(stmt, 5);
+      const auto evidence = std::max(created, partUpdated);
+      const bool fresh = evidence >= processStart &&
+                         evidence > std::max(session.startedAt, session.endedAt);
+      const bool closedTurn = session.endedAt && !turn.empty() && turn == session.turnId;
+      if (fresh && !closedTurn && !completed &&
+          (finish.empty() || (finish == L"tool-calls" && partUpdated >= processStart))) {
+        session.running = true;
+        session.uncertain = true;
+        session.turnId = turn;
+        session.startedAt = created >= processStart ? created : partUpdated;
+        session.endedAt = 0;
+      }
+    }
+    sql.finalize(stmt);
+  }
+}
+void ReadCurrentQuestions(const fs::path &root, Snapshot &snapshot, int64_t processStart) {
   Sqlite sql;
   if (!sql.valid())
     return;
   auto path = Utf8((root / L"cli/db/db.sqlite").wstring());
   if (sql.open(path.c_str(), &sql.db, 1, nullptr) != 0)
     return;
+  ReadRunningFallback(sql, snapshot, processStart);
   ReadQuestionsFromDb(sql, snapshot);
 }
 int64_t ProcessStart() {
@@ -352,7 +396,7 @@ Snapshot Observe() {
     }
   }
   if (start)
-    ReadCurrentQuestions(root, out);
+    ReadCurrentQuestions(root, out, start);
   std::stable_sort(out.sessions.begin(), out.sessions.end(),
                    [](auto &a, auto &b) {
                      return a.waiting != b.waiting ? a.waiting > b.waiting
@@ -440,6 +484,55 @@ bool ObserverTests() {
   ReadQuestionsFromDb(fixture, waiting);
   if (waiting.sessions[0].waiting || waiting.sessions[0].resumedAt != 400)
     return false;
+  if (!exec(R"SQL(INSERT INTO message VALUES('fallback','fallback',1000,1,'{"role":"assistant","anchor":{"turnId":"new"}}'))SQL"))
+    return false;
+  Snapshot fallback;
+  fallback.online = true;
+  Session row;
+  row.id = L"fallback";
+  fallback.sessions = {row};
+  ReadRunningFallback(fixture, fallback, 900);
+  if (!fallback.sessions[0].running || !fallback.sessions[0].uncertain)
+    return false;
+  fallback.sessions = {row};
+  ReadRunningFallback(fixture, fallback, 1100);
+  if (fallback.sessions[0].running)
+    return false;
+  if (!exec(R"SQL(UPDATE message SET data=json_set(data,'$.time.completed',1200) WHERE id='fallback')SQL"))
+    return false;
+  fallback.sessions = {row};
+  ReadRunningFallback(fixture, fallback, 900);
+  if (fallback.sessions[0].running)
+    return false;
+  if (!exec(R"SQL(UPDATE message SET data=json_remove(json_set(data,'$.finish','tool-calls'),'$.time.completed') WHERE id='fallback')SQL") ||
+      !exec(R"SQL(INSERT INTO part(message_id,session_id,time_created,sequence,data,time_updated) VALUES('fallback','fallback',1000,1,'{"state":{"status":"running"}}',1100))SQL"))
+    return false;
+  fallback.sessions = {row};
+  ReadRunningFallback(fixture, fallback, 900);
+  if (!fallback.sessions[0].running)
+    return false;
+  if (!exec(R"SQL(UPDATE part SET data=json_set(data,'$.state.time.end',1200) WHERE message_id='fallback')SQL"))
+    return false;
+  fallback.sessions = {row};
+  ReadRunningFallback(fixture, fallback, 900);
+  if (fallback.sessions[0].running)
+    return false;
+  if (!exec(R"SQL(UPDATE part SET data=json_remove(data,'$.state.time.end') WHERE message_id='fallback')SQL"))
+    return false;
+  row.turnId = L"new";
+  row.endedAt = 1050;
+  fallback.sessions = {row};
+  ReadRunningFallback(fixture, fallback, 900);
+  if (fallback.sessions[0].running)
+    return false; // An explicit log end wins over a lingering running part.
+  row.turnId.clear();
+  row.endedAt = 0;
+  if (!exec(R"SQL(INSERT INTO message VALUES('newest','fallback',1200,2,'{"role":"assistant","finish":"stop"}'))SQL"))
+    return false;
+  fallback.sessions = {row};
+  ReadRunningFallback(fixture, fallback, 900);
+  if (fallback.sessions[0].running)
+    return false; // Never inspect running parts belonging to older messages.
   std::map<std::wstring, Activity> e;
   Apply(e, {{"sessionId", "a"}, {"kind", "turn-started"}, {"turnId", "t1"}},
         100);

@@ -1,3 +1,4 @@
+#include "text_raster.h"
 #include <windows.h>
 #include "observer.h"
 #include "subpixel.h"
@@ -236,8 +237,10 @@ void NavigationFeedback(NavigationCode code) {
     const wchar_t *text = L"未能打开会话，请在 ZCode 中手动选择后重试。";
     if (code == NavigationCode::Ambiguous)
       text = L"项目或会话存在重名，无法唯一定位。请在 ZCode 中手动选择。";
-    else if (code == NavigationCode::NotVisible)
-      text = L"请先在 ZCode 侧栏展开对应项目，并让会话条目可见后重试。";
+    else if (code == NavigationCode::NotFound)
+      text = L"找不到条目：请在 ZCode 侧栏展开对应项目或取消筛选后重试。";
+    else if (code == NavigationCode::Offscreen)
+      text = L"条目离屏：请滚动 ZCode 侧栏，让该会话进入可见区域后重试。";
     else if (code == NavigationCode::AppClosed ||
              code == NavigationCode::Unavailable)
       text = L"ZCode 未运行或会话信息不可用，暂时无法跳转。";
@@ -262,7 +265,7 @@ void OpenSession(const Session &captured) {
     NavigationFeedback(prepared.code);
     return;
   }
-  if (NavigateToSession(prepared.session))
+  if (NavigateToSession(prepared.session, snapshot.sessions))
     NavigationFeedback(NavigationCode::Busy);
 }
 std::optional<Session> HitSession(HWND window, LPARAM position) {
@@ -510,8 +513,8 @@ void Text(const std::wstring &s, float x, float y, float w, float h, float size,
     ComPtr<ID2D1SolidColorBrush> brush;
     canvas->CreateSolidColorBrush(color, &brush);
     canvas->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-    canvas->DrawTextLayout(D2D1::Point2F(x, originY), layout.Get(), brush.Get(),
-                           D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    canvas->DrawTextLayout(TextRasterOrigin(canvas, x, originY), layout.Get(), brush.Get(),
+                           StableTextOptions);
   }
   if (shimmer && !gpuProfileNoShimmer) {
     // Highlight only the glyphs, with transparent ends so the deep base text
@@ -539,8 +542,8 @@ void Text(const std::wstring &s, float x, float y, float w, float h, float size,
       canvas->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
       if (gpuProfileNoMask || !PaintTextMask(canvas,layout.Get(),light.Get(),x,originY,
                                             D2D1::RectF(x,y,x+w,y+h),dpi))
-        canvas->DrawTextLayout(D2D1::Point2F(x, originY), layout.Get(), light.Get(),
-                               D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        canvas->DrawTextLayout(TextRasterOrigin(canvas, x, originY), layout.Get(), light.Get(),
+                               StableTextOptions);
     }
   }
   canvas->PopAxisAlignedClip();
@@ -1389,8 +1392,8 @@ void PaintCapsule(HWND window) {
           renderer->Release();
         } else {
           target->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
-          target->DrawTextLayout(D2D1::Point2F(RowTitleLeft, y), layout.Get(),
-                                 body.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+          target->DrawTextLayout(TextRasterOrigin(target.Get(), RowTitleLeft, y), layout.Get(),
+                                 body.Get(), StableTextOptions);
         }
         target->PopAxisAlignedClip();
       }
