@@ -7,6 +7,7 @@
 #include <chrono>
 #include <fstream>
 #include <map>
+#include <memory>
 #include <set>
 #include <stdexcept>
 using json = nlohmann::json;
@@ -95,9 +96,18 @@ struct Reader {
   std::map<fs::path, Cursor> cursors;
   fs::recursive_directory_iterator scan, end;
   ULONGLONG nextScan = 0;
+  std::shared_ptr<void> discoveryWatch;
   uint64_t bytes = 0, parses = 0;
   size_t nextRead = 0;
   void Discover() {
+    if(!discoveryWatch){
+      const auto handle=FindFirstChangeNotificationW(root.c_str(),TRUE,FILE_NOTIFY_CHANGE_DIR_NAME|FILE_NOTIFY_CHANGE_FILE_NAME);
+      if(handle!=INVALID_HANDLE_VALUE)discoveryWatch={handle,[](void* value){FindCloseChangeNotification(value);}};
+    }
+    if(discoveryWatch && WaitForSingleObject(discoveryWatch.get(),0)==WAIT_OBJECT_0){
+      nextScan=0;
+      if(!FindNextChangeNotification(discoveryWatch.get()))discoveryWatch.reset();
+    }
     std::error_code ec;
     if (scan == end && GetTickCount64() >= nextScan) {
       scan = fs::recursive_directory_iterator(
