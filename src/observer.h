@@ -6,6 +6,7 @@ enum class SourceId { ZCode, DeepSeek };
 struct Session {
   std::wstring id, workspace, title, path, result;
   SourceId source = SourceId::ZCode;
+  bool catchingUp=false;
   bool running = false, uncertain = false;
   int64_t updated = 0;
   std::wstring turnId;

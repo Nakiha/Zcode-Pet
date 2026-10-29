@@ -5,6 +5,7 @@
 #include <algorithm>
 namespace {
 std::atomic<unsigned> enabled{3}, detected{0};
+std::atomic_bool harnessBacklog = false;
 std::filesystem::path home, harness;
 std::wstring Env(const wchar_t *key) {
   wchar_t value[32768]{};
@@ -12,6 +13,10 @@ std::wstring Env(const wchar_t *key) {
   return value;
 }
 } // namespace
+unsigned SourcePollIntervalMs() {
+  return harnessBacklog.load() && (enabled.load() & 2) ? 200 : 2000;
+}
+void SetHarnessBacklog(bool pending) { harnessBacklog = pending; }
 void InitializeDataSources() {
   home = Env(L"USERPROFILE");
   auto configured = Env(L"DSH_HOME");
@@ -65,7 +70,13 @@ Snapshot Observe() {
   for (unsigned bit : {1u, 2u})
     if (active & bit) {
       try {
-        auto part = bit == 1 ? ObserveZCode() : ObserveDeepSeek(harness);
+        static thread_local Snapshot zcodeCache;
+        static thread_local ULONGLONG nextZcode = 0;
+        if (bit == 1 && GetTickCount64() >= nextZcode) {
+          zcodeCache = ObserveZCode();
+          nextZcode = GetTickCount64() + 2000;
+        }
+        auto part = bit == 1 ? zcodeCache : ObserveDeepSeek(harness);
         merged.online |= part.online;
         if (!part.error.empty())
           merged.sourceWarning +=

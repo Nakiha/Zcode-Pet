@@ -5,6 +5,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -13,7 +14,10 @@ namespace {
 std::mutex mutex;
 std::condition_variable ready;
 std::thread worker;
-struct NavigationRequest { Session session; std::vector<Session> peers; };
+struct NavigationRequest {
+  Session session;
+  std::vector<Session> peers;
+};
 std::optional<NavigationRequest> request;
 std::optional<NavigationResult> completed;
 NavigationResult last;
@@ -62,13 +66,15 @@ FindAll(IUIAutomationElement *root, TreeScope scope,
   }
   return result;
 }
-bool IsZCodeWindow(HWND window) {
+bool IsSourceWindow(HWND window, SourceId source) {
   if ((!IsWindowVisible(window) && !IsIconic(window)) ||
       GetWindow(window, GW_OWNER))
     return false;
   wchar_t title[128]{};
   GetWindowTextW(window, title, 128);
-  if (wcscmp(title, L"ZCode") != 0)
+  if (source == SourceId::ZCode ? wcscmp(title, L"ZCode") != 0
+                                : (!wcsstr(title, L"DeepSeek Harness") &&
+                                   wcscmp(title, L"DSH 本地构建") != 0))
     return false;
   DWORD pid = 0;
   GetWindowThreadProcessId(window, &pid);
@@ -80,18 +86,32 @@ bool IsZCodeWindow(HWND window) {
   const bool read =
       QueryFullProcessImageNameW(process, 0, path, &length) != FALSE;
   CloseHandle(process);
-  return read && _wcsicmp(std::filesystem::path(path).filename().c_str(),
-                          L"ZCode.exe") == 0;
+  if (!read)
+    return false;
+  if (source == SourceId::ZCode)
+    return _wcsicmp(std::filesystem::path(path).filename().c_str(),
+                    L"ZCode.exe") == 0;
+  wchar_t expected[32768]{};
+  GetEnvironmentVariableW(L"ZCODEPET_HARNESS_EXECUTABLE", expected, 32768);
+  std::error_code ec;
+  return _wcsicmp(std::filesystem::path(path).filename().c_str(),
+                  L"DeepSeek Harness.exe") == 0 ||
+         (expected[0] && std::filesystem::equivalent(path, expected, ec));
 }
-std::vector<HWND> Windows() {
+std::vector<HWND> Windows(SourceId source) {
   std::vector<HWND> windows;
+  struct Context {
+    std::vector<HWND> *windows;
+    SourceId source;
+  } ctx{&windows, source};
   EnumWindows(
       [](HWND window, LPARAM context) -> BOOL {
-        if (IsZCodeWindow(window))
-          reinterpret_cast<std::vector<HWND> *>(context)->push_back(window);
+        auto &ctx = *reinterpret_cast<Context *>(context);
+        if (IsSourceWindow(window, ctx.source))
+          ctx.windows->push_back(window);
         return TRUE;
       },
-      reinterpret_cast<LPARAM>(&windows));
+      reinterpret_cast<LPARAM>(&ctx));
   return windows;
 }
 // 项目分组名是列表的兄弟节点；不能在整棵树中只按标题找，正文也可能重复标题。
@@ -144,15 +164,16 @@ bool InProject(IUIAutomation *uia, IUIAutomationElement *row,
   }
   return false;
 }
-ComPtr<IUIAutomationElement> ListRow(IUIAutomation *uia,
-                                     IUIAutomationElement *text) {
+ComPtr<IUIAutomationElement>
+ListRow(IUIAutomation *uia, IUIAutomationElement *text, bool tree = false) {
   ComPtr<IUIAutomationTreeWalker> walker;
   uia->get_ControlViewWalker(&walker);
   ComPtr<IUIAutomationElement> node = text;
   for (int depth = 0; walker && node && depth < 4; ++depth) {
     CONTROLTYPEID type = 0;
     node->get_CurrentControlType(&type);
-    if (type == UIA_ListItemControlTypeId) {
+    if (type ==
+        (tree ? UIA_TreeItemControlTypeId : UIA_ListItemControlTypeId)) {
       BOOL focusable = FALSE;
       node->get_CurrentIsKeyboardFocusable(&focusable);
       // 普通对话正文的 li 不可聚焦，不能把正文中的同名文本当作侧栏会话。
@@ -191,17 +212,39 @@ bool Activate(HWND window) {
   }
   return false;
 }
-NavigationResult Open(IUIAutomation *uia, const Session &session, const std::vector<Session> &peers) {
-  if(session.source!=SourceId::ZCode)return {NavigationCode::UnsupportedSource};
+bool InHarnessTree(IUIAutomation *uia, IUIAutomationElement *row) {
+  ComPtr<IUIAutomationTreeWalker> walker;
+  uia->get_ControlViewWalker(&walker);
+  ComPtr<IUIAutomationElement> node = row;
+  for (int i = 0; walker && node && i < 8; ++i) {
+    CONTROLTYPEID type = 0;
+    node->get_CurrentControlType(&type);
+    if (type == UIA_TreeControlTypeId) {
+      auto name = Name(node.Get());
+      return name == L"会话" || name == L"Sessions";
+    }
+    ComPtr<IUIAutomationElement> parent;
+    walker->GetParentElement(node.Get(), &parent);
+    node = parent;
+  }
+  return false;
+}
+NavigationResult Open(IUIAutomation *uia, const Session &session,
+                      const std::vector<Session> &peers) {
+
   if (!uia)
     return {NavigationCode::AutomationFailed};
   const auto deadline = GetTickCount64() + 6000;
-  const auto windows = Windows();
+  const auto windows = Windows(session.source);
   scanWindows = (int)windows.size();
   if (windows.empty())
     return {NavigationCode::AppClosed};
   ComPtr<IUIAutomationCondition> title;
-  VARIANT rowType{}; rowType.vt = VT_I4; rowType.lVal = UIA_ListItemControlTypeId;
+  VARIANT rowType{};
+  rowType.vt = VT_I4;
+  rowType.lVal = session.source == SourceId::DeepSeek
+                     ? UIA_TreeItemControlTypeId
+                     : UIA_ListItemControlTypeId;
   uia->CreatePropertyCondition(UIA_ControlTypePropertyId, rowType, &title);
   if (!title)
     return {NavigationCode::AutomationFailed};
@@ -222,10 +265,13 @@ NavigationResult Open(IUIAutomation *uia, const Session &session, const std::vec
       if (stopping || GetTickCount64() > deadline)
         return {NavigationCode::Cancelled};
       ++scanTitles;
-      auto row = ListRow(uia, text.Get());
+      auto row = ListRow(uia, text.Get(), session.source == SourceId::DeepSeek);
       if (row)
         ++scanRows;
-      if (!row || !InProject(uia, row.Get(), project) ||
+      if (!row ||
+          !(session.source == SourceId::DeepSeek
+                ? InHarnessTree(uia, row.Get())
+                : InProject(uia, row.Get(), project)) ||
           !ContainsTitle(uia, row.Get(), session, peers))
         continue;
       bool duplicate = false;
@@ -256,7 +302,9 @@ NavigationResult Open(IUIAutomation *uia, const Session &session, const std::vec
   if (!enabled)
     return {NavigationCode::AutomationFailed, count};
   if (!ContainsTitle(uia, match.row.Get(), session, peers) ||
-      !InProject(uia, match.row.Get(), project))
+      !(session.source == SourceId::DeepSeek
+            ? InHarnessTree(uia, match.row.Get())
+            : InProject(uia, match.row.Get(), project)))
     return {NavigationCode::NotFound, count};
   if (stopping || !Foreground(match.window))
     return {NavigationCode::FocusFailed, count};
@@ -371,7 +419,8 @@ void StopSessionNavigation() {
   completed.reset();
   busy = false;
 }
-bool NavigateToSession(const Session &session, const std::vector<Session> &peers) {
+bool NavigateToSession(const Session &session,
+                       const std::vector<Session> &peers) {
   std::lock_guard lock(mutex);
   if (stopping || busy || !worker.joinable())
     return false;
@@ -399,4 +448,23 @@ int NavigationDiagnostic(unsigned field) {
          : field == 2 ? scanRows.load()
          : field == 3 ? scanProjectNames.load()
                       : scanProjectType.load();
+}
+
+bool HarnessNavigationSmoke() {
+  auto hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+  if (FAILED(hr))
+    return false;
+  ComPtr<IUIAutomation> automation;
+  CoCreateInstance(CLSID_CUIAutomation, nullptr, CLSCTX_INPROC_SERVER,
+                   IID_PPV_ARGS(&automation));
+  Session target;
+  target.source = SourceId::DeepSeek;
+  target.id = L"smoke";
+  target.workspace = L"deepseek:smoke";
+  target.title = L"新会话";
+  auto result = Open(automation.Get(), target, {target});
+  std::ofstream report("harness-navigation-smoke.txt");report<<(int)result.code<<","<<result.matches<<","<<scanWindows<<","<<scanTitles<<","<<scanRows;
+  automation.Reset();
+  CoUninitialize();
+  return result.code == NavigationCode::Opened;
 }

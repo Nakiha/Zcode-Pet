@@ -4,7 +4,7 @@
 
 [下载最新版本](https://github.com/Nakiha/Zcode-Pet/releases/latest) · [运行行为](spec/behavior.md) · [性能说明](docs/performance.md)
 
-开发版增加独立数据源：右键 → **数据源** 勾选 ZCode / DeepSeek Harness，启动自动探查，选择会保存。Harness 当前支持默认压缩的 v4 会话日志、运行/结束与审批等待状态；已用源码 Harness 运行时与本地 mock 验证运行→完成、气泡和宠物动作；插件特有状态与 Harness 点击跳转尚未适配。详细范围见[数据源说明](docs/data-sources.md)。
+开发版增加独立数据源：右键 → **数据源** 勾选 ZCode / DeepSeek Harness，启动自动探查，选择会保存。Harness 当前支持默认压缩的 v4 会话日志、运行/结束与审批等待状态；已用源码 Harness 运行时与本地 mock 验证运行→完成、气泡和宠物动作；Harness 支持标题/提醒的 UIA 跳转；插件特有状态仍需适配。详细范围见[数据源说明](docs/data-sources.md)。
 
 ## 运行
 

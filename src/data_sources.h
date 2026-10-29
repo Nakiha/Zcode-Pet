@@ -8,6 +8,8 @@ struct SourceInfo {
   bool enabled, detected;
 };
 void InitializeDataSources();
+unsigned SourcePollIntervalMs();
+void SetHarnessBacklog(bool pending);
 std::array<SourceInfo, 2> DataSources();
 void ToggleDataSource(SourceId id);
 Snapshot ObserveZCode();

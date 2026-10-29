@@ -80,7 +80,6 @@ struct NavigationPreparation {
 };
 inline NavigationPreparation PrepareNavigation(const Session &captured,
                                                const Snapshot &latest) {
-  if(captured.source!=SourceId::ZCode)return {NavigationCode::UnsupportedSource,{}};
   if (!latest.online || !latest.error.empty())
     return {NavigationCode::Unavailable, {}};
   auto found =
@@ -89,13 +88,13 @@ inline NavigationPreparation PrepareNavigation(const Session &captured,
   if (found == latest.sessions.end())
     return {NavigationCode::Missing, {}};
   if (found->id.empty() || found->workspace.empty() || found->title.empty() ||
-      NavigationProjectName(*found).empty())
+      (found->source==SourceId::ZCode && NavigationProjectName(*found).empty()))
     return {NavigationCode::Unavailable, {}};
   if (found->projectNameAmbiguous)
     return {NavigationCode::Ambiguous, {}};
   for (const auto &s : latest.sessions)
     if (s.source==found->source && !SameSession(s, *found) && s.title == found->title &&
-        SameProject(NavigationProjectName(s), NavigationProjectName(*found)))
+        (found->source==SourceId::DeepSeek || SameProject(NavigationProjectName(s), NavigationProjectName(*found))))
       return {NavigationCode::Ambiguous, {}};
   return {NavigationCode::Idle, *found};
 }
@@ -106,6 +105,11 @@ inline int SessionRowAt(float y, float height, int scroll, size_t count) {
   return row >= 0 && (size_t)row < count ? row : -1;
 }
 inline bool NavigationModelTests() {
+  Session harness;harness.id=L"ds";harness.source=SourceId::DeepSeek;harness.workspace=L"deepseek:default";harness.title=L"标题";
+  Snapshot ds;ds.online=true;ds.sessions={harness};
+  if(PrepareNavigation(harness,ds).code!=NavigationCode::Idle)return false;
+  auto duplicate=harness;duplicate.id=L"other";duplicate.workspace=L"another";ds.sessions.push_back(duplicate);
+  if(PrepareNavigation(harness,ds).code!=NavigationCode::Ambiguous)return false;
   Session renamed;
   renamed.id = L"renamed";
   renamed.workspace = L"workspace-id";

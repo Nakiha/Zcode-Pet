@@ -226,7 +226,7 @@ public:
     if (!snapshot.online || !snapshot.error.empty())
       return result;
     for (const auto &s : snapshot.sessions) {
-      if (s.endedAt <= startedAt || s.running || s.turnId.empty())
+      if (s.catchingUp || s.uncertain || s.endedAt <= startedAt || s.running || s.turnId.empty())
         continue;
       auto key = s.workspace + L"\n" + s.id + L"\n" + s.turnId;
       if (seen[key] >= s.endedAt)
@@ -247,7 +247,7 @@ public:
     if (!snapshot.online || !snapshot.error.empty())
       return result;
     for (const auto &s : snapshot.sessions)
-      if (s.waiting && !s.interactionId.empty()) {
+      if (!s.catchingUp && !s.uncertain && s.waiting && !s.interactionId.empty()) {
         auto key = s.workspace + L"\n" + s.id + L"\n" + s.turnId + L"\n" +
                    s.interactionId;
         if (!seen[key]) {

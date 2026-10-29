@@ -235,22 +235,22 @@ void NavigationFeedback(NavigationCode code) {
                            ? L"ZCode Pet · 正在定位会话…"
                            : L"ZCode Pet · 只读状态观察");
   if (code != NavigationCode::Busy && code != NavigationCode::Opened) {
-    const wchar_t *text = L"未能打开会话，请在 ZCode 中手动选择后重试。";
+    const wchar_t *text = L"未能打开会话，请在对应应用中手动选择后重试。";
     if (code == NavigationCode::Ambiguous)
-      text = L"项目或会话存在重名，无法唯一定位。请在 ZCode 中手动选择。";
+      text = L"项目或会话存在重名，无法唯一定位。请在对应应用中手动选择。";
     else if (code == NavigationCode::NotFound)
-      text = L"找不到条目：请在 ZCode 侧栏展开对应项目或取消筛选后重试。";
+      text = L"找不到条目：请在应用侧栏展开对应工作区或取消筛选后重试。";
     else if (code == NavigationCode::Offscreen)
-      text = L"条目离屏：请滚动 ZCode 侧栏，让该会话进入可见区域后重试。";
+      text = L"条目离屏：请滚动应用侧栏，让该会话进入可见区域后重试。";
     else if (code == NavigationCode::AppClosed ||
              code == NavigationCode::Unavailable)
-      text = L"ZCode 未运行或会话信息不可用，暂时无法跳转。";
+      text = L"对应应用未运行或会话信息不可用，暂时无法跳转。";
     else if(code==NavigationCode::UnsupportedSource)
       text=L"Harness 会话监控已接入，桌面跳转尚未适配，请在 Harness 中选择会话。";
     else if (code == NavigationCode::Missing)
-      text = L"该会话已不在当前观察列表中，请在 ZCode 中查找。";
+      text = L"该会话已不在当前观察列表中，请在对应应用中查找。";
     else if (code == NavigationCode::FocusFailed)
-      text = L"未能聚焦会话条目，请切回 ZCode 后重试。";
+      text = L"未能聚焦会话条目，请切回对应应用后重试。";
     icon.uFlags |= NIF_INFO;
     icon.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
     wcscpy_s(icon.szInfoTitle, L"未能定位会话");
@@ -610,6 +610,7 @@ int64_t WallClockMs() {
       .count();
 }
 std::wstring Status(const Session &s) {
+  if(s.catchingUp)return L"同步中";
   const bool known = s.endedAt > 0;
   switch (StateOf(s, snapshot.online)) {
   case SessionState::Offline:
@@ -2039,6 +2040,7 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 }
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   InitializeDataSources();
+  if(wcsstr(command,L"--harness-navigation-smoke"))return HarnessNavigationSmoke()?0:1;
   if(wcsstr(command,L"--source-diagnostic")){std::ofstream f("source-diagnostic.csv");f<<"sample,harness,running,completed,unknown,warning\n";for(int i=0;i<15;++i){auto snap=Observe();int count=0,running=0,completed=0,unknown=0;for(auto& row:snap.sessions)if(row.source==SourceId::DeepSeek){++count;running+=row.running;completed+=row.result==L"completed";unknown+=row.uncertain;}f<<i<<","<<count<<","<<running<<","<<completed<<","<<unknown<<","<<!snap.sourceWarning.empty()<<"\n";f.flush();Sleep(1000);}return 0;}
   if(wcsstr(command,L"--source-benchmark"))return DataSourceTests(true)?0:1;
   if(wcsstr(command,L"--data-sources-test"))return DataSourceTests()?0:1;
@@ -2065,7 +2067,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
     };
     for(int sample=0;sample<24;++sample) {
       const auto before=cpu();
-      const auto observed=Observe();
+      const auto observed=ObserveZCode();
       const auto used=cpu()-before;
       const auto t=LastObserverTiming();
       results << sample << ',' << used << ',' << t.processUs << ',' << t.indexUs
@@ -2534,7 +2536,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
         pending = std::move(s);
       }
       PostMessageW(pet, Refresh, 0, 0);
-      for (int i = 0; i < 20 && !quitting; ++i)
+      for (int i = 0; i < (int)(SourcePollIntervalMs()/100) && !quitting; ++i)
         Sleep(100);
     }
   });

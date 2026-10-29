@@ -8,6 +8,7 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <set>
 #include <stdexcept>
 using json = nlohmann::json;
@@ -23,7 +24,7 @@ std::wstring Wide(const std::string &s) {
 }
 struct Fold {
   Session s;
-  bool header = false, hidden = false;
+  bool header = false, hidden = false, boundary = false;
   std::set<std::wstring> approvals;
   void Apply(const json &v) {
     const auto type = v.value("type", std::string{});
@@ -34,7 +35,7 @@ struct Fold {
       s.id = Wide(v.at("id").get<std::string>());
       s.path = Wide(v.value("cwd", std::string{}));
       s.workspace = L"deepseek:" + s.path;
-      s.title = L"DeepSeek 会话";
+      s.title = L"新会话";
       s.updated = v.value("createdAt", int64_t{});
       hidden = v.value("origin", std::string{}) == "subagent";
       header = true;
@@ -48,6 +49,7 @@ struct Fold {
     if (type == "session/title")
       s.title = Wide(d.at("title").get<std::string>());
     if (type == "turn/start") {
+      boundary = true;
       s.turnId = std::to_wstring(d.at("turn").get<int64_t>());
       s.startedAt = at;
       s.endedAt = 0;
@@ -56,7 +58,10 @@ struct Fold {
       approvals.clear();
     }
     if (type == "turn/end" &&
-        s.turnId == std::to_wstring(d.at("turn").get<int64_t>())) {
+        (s.turnId.empty() ||
+         s.turnId == std::to_wstring(d.at("turn").get<int64_t>()))) {
+      boundary = true;
+      s.turnId = std::to_wstring(d.at("turn").get<int64_t>());
       auto reason = d.at("reason").value("kind", std::string{});
       s.running = false;
       s.endedAt = at;
@@ -89,7 +94,10 @@ struct Cursor {
   uint64_t offset = 0, observedSize = 0;
   FILETIME written{}, creation{};
   DWORD volume = 0, indexHigh = 0, indexLow = 0;
-  bool failed = false;
+  bool failed = false, bufferedReady = false;
+  std::vector<char> pending;
+  uint64_t target = 0;
+  std::optional<Fold> published;
 };
 struct Reader {
   fs::path root;
@@ -99,14 +107,21 @@ struct Reader {
   std::shared_ptr<void> discoveryWatch;
   uint64_t bytes = 0, parses = 0;
   size_t nextRead = 0;
+  bool deferred=false;
   void Discover() {
-    if(!discoveryWatch){
-      const auto handle=FindFirstChangeNotificationW(root.c_str(),TRUE,FILE_NOTIFY_CHANGE_DIR_NAME|FILE_NOTIFY_CHANGE_FILE_NAME);
-      if(handle!=INVALID_HANDLE_VALUE)discoveryWatch={handle,[](void* value){FindCloseChangeNotification(value);}};
+    if (!discoveryWatch) {
+      const auto handle = FindFirstChangeNotificationW(
+          root.c_str(), TRUE,
+          FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_FILE_NAME);
+      if (handle != INVALID_HANDLE_VALUE)
+        discoveryWatch = {
+            handle, [](void *value) { FindCloseChangeNotification(value); }};
     }
-    if(discoveryWatch && WaitForSingleObject(discoveryWatch.get(),0)==WAIT_OBJECT_0){
-      nextScan=0;
-      if(!FindNextChangeNotification(discoveryWatch.get()))discoveryWatch.reset();
+    if (discoveryWatch &&
+        WaitForSingleObject(discoveryWatch.get(), 0) == WAIT_OBJECT_0) {
+      nextScan = 0;
+      if (!FindNextChangeNotification(discoveryWatch.get()))
+        discoveryWatch.reset();
     }
     std::error_code ec;
     if (scan == end && GetTickCount64() >= nextScan) {
@@ -180,7 +195,7 @@ struct Reader {
         (c.failed &&
          (size != c.observedSize ||
           CompareFileTime(&c.written, &info.ftLastWriteTime) != 0)) ||
-        size < c.offset ||
+        size < c.offset + c.pending.size() ||
         (size == c.offset &&
          CompareFileTime(&c.written, &info.ftLastWriteTime) != 0))
       c = Cursor{};
@@ -192,68 +207,195 @@ struct Reader {
       return true;
     if (size == c.offset)
       return true;
-    if (!budget)
+    if (!budget && c.pending.empty())
       return true;
-    const auto count =
-        (DWORD)std::min<uint64_t>({size - c.offset, budget, 4 * 1024 * 1024});
-    std::vector<char> input(count);
-    LARGE_INTEGER position{};
-    position.QuadPart = c.offset;
-    DWORD got = 0;
-    if (!SetFilePointerEx(h, position, nullptr, FILE_BEGIN) ||
-        !ReadFile(h, input.data(), count, &got, nullptr))
-      return false;
-    budget -= got;
-    bytes += got;
-    input.resize(got);
-    size_t used = 0;
+    const bool compressed = p.extension() == L".zstd";
+    auto records = [&](Fold &fold, const char *data, size_t n) {
+      size_t begin = 0;
+      for (size_t i = 0; i < n; ++i)
+        if (data[i] == '\n') {
+          auto value = json::parse(
+              data + begin, data + i,
+              [](int, json::parse_event_t event, json &value) {
+                if (event != json::parse_event_t::key)
+                  return true;
+                const auto key = value.get<std::string>();
+                return key == "type" || key == "data" || key == "version" ||
+                       key == "id" || key == "createdAt" || key == "cwd" ||
+                       key == "origin" || key == "time" || key == "turn" ||
+                       key == "reason" || key == "kind" || key == "title";
+              });
+          fold.Apply(value);
+          ++parses;
+          begin = i + 1;
+        }
+      return begin;
+    };
+    auto decode = [&](Fold &fold, const char *data, size_t frame) {
+      auto length = ZSTD_getFrameContentSize(data, frame);
+      if (length == ZSTD_CONTENTSIZE_ERROR)
+        throw std::runtime_error("invalid frame");
+      if (length == ZSTD_CONTENTSIZE_UNKNOWN)
+        length = 32 * 1024 * 1024;
+      if (length > 32 * 1024 * 1024)
+        throw std::runtime_error("oversize frame");
+      std::vector<char> decoded((size_t)length);
+      auto output =
+          ZSTD_decompress(decoded.data(), decoded.size(), data, frame);
+      if (ZSTD_isError(output) ||
+          records(fold, decoded.data(), output) != output)
+        throw std::runtime_error("invalid frame records");
+    };
+    auto readAt = [&](uint64_t at, size_t length) {
+      std::vector<char> data(length);
+      LARGE_INTEGER pos{};
+      pos.QuadPart = at;
+      DWORD got = 0;
+      if (!SetFilePointerEx(h, pos, nullptr, FILE_BEGIN) ||
+          !ReadFile(h, data.data(), (DWORD)length, &got, nullptr))
+        throw std::runtime_error("read failed");
+      data.resize(got);
+      bytes += got;
+      budget -= std::min(budget, (size_t)got);
+      return data;
+    };
     try {
-      const bool compressed = p.extension() == L".zstd";
-      auto records = [&](const char *data, size_t n) {
-        size_t start = 0;
-        for (size_t i = 0; i < n; ++i)
-          if (data[i] == '\n') {
-            auto v = json::parse(data + start, data + i);
-            c.fold.Apply(v);
-            ++parses;
-            start = i + 1;
+      // Independent Zstd frames allow a recent-state bootstrap without
+      // replaying old tool outputs. Accept only a validated contiguous frame
+      // chain.
+      if ((!c.published || c.offset + 2 * 1024 * 1024 < size) &&
+          size > 2 * 1024 * 1024 && budget >= 2 * 1024 * 1024 + 64 * 1024 && compressed) {
+        auto head = readAt(0, 64 * 1024);
+        auto first = ZSTD_findFrameCompressedSize(head.data(), head.size());
+        if (!ZSTD_isError(first)) {
+          Fold headerState;
+          size_t headerUsed = 0;
+          while (headerUsed < head.size()) {
+            auto part = ZSTD_findFrameCompressedSize(head.data() + headerUsed,
+                                                     head.size() - headerUsed);
+            if (ZSTD_isError(part))
+              break;
+            decode(headerState, head.data() + headerUsed, part);
+            headerUsed += part;
           }
-        return start;
-      };
+          if (headerState.header) {
+            headerState.s.running = false;
+            headerState.s.turnId.clear();
+            headerState.boundary = false;
+            headerState.s.result.clear();
+            headerState.s.endedAt = 0;
+            headerState.s.startedAt = 0;
+            headerState.s.waiting = false;
+            headerState.approvals.clear();
+            const auto start = size - 2 * 1024 * 1024;
+            auto tail = readAt(start, 2 * 1024 * 1024);
+            for (size_t i = 0; i + 4 < tail.size(); ++i) {
+              if ((unsigned char)tail[i] != 0x28 ||
+                  (unsigned char)tail[i + 1] != 0xb5 ||
+                  (unsigned char)tail[i + 2] != 0x2f ||
+                  (unsigned char)tail[i + 3] != 0xfd)
+                continue;
+              auto frame = ZSTD_findFrameCompressedSize(tail.data() + i,
+                                                        tail.size() - i);
+              if (ZSTD_isError(frame))
+                continue;
+              Fold recent = headerState;
+              size_t consumed = i;
+              try {
+                while (consumed < tail.size()) {
+                  frame = ZSTD_findFrameCompressedSize(tail.data() + consumed,
+                                                       tail.size() - consumed);
+                  if (ZSTD_isError(frame)) {
+                    if (ZSTD_getErrorCode(frame) == ZSTD_error_srcSize_wrong)
+                      break;
+                    throw std::runtime_error("bad tail");
+                  }
+                  decode(recent, tail.data() + consumed, frame);
+                  consumed += frame;
+                }
+                if (recent.boundary) {
+                  c.fold = recent;
+                  c.published = recent;
+                  c.offset = start + consumed;
+                  c.pending.assign(tail.begin() + consumed, tail.end());
+                  c.target = size;
+                  break;
+                }
+              } catch (
+                  ...) { /* A magic-like byte sequence is not a valid chain. */
+              }
+              break; // One valid chain, not an unbounded search/decode loop.
+            }
+          }
+        }
+      }
+      if ((!c.published || c.offset + 2 * 1024 * 1024 < size) &&
+          size > 2 * 1024 * 1024 && budget >= 2 * 1024 * 1024 + 64 * 1024 && !compressed) {
+        auto head = readAt(0, 64 * 1024);
+        auto newline = std::find(head.begin(), head.end(), '\n');
+        if (newline != head.end()) {
+          Fold recent;
+          records(recent, head.data(), newline - head.begin() + 1);
+          const auto start = size - 2 * 1024 * 1024;
+          auto tail = readAt(start, 2 * 1024 * 1024);
+          auto line = std::find(tail.begin(), tail.end(), '\n');
+          if (line != tail.end()) {
+            size_t skip = line - tail.begin() + 1,
+                   used =
+                       records(recent, tail.data() + skip, tail.size() - skip);
+            if (recent.boundary) {
+              c.fold = recent;
+              c.published = recent;
+              c.offset = start + skip + used;
+              c.pending.assign(tail.begin() + skip + used, tail.end());
+              c.target = size;
+            }
+          }
+        }
+      }
+      if (!c.target)
+        c.target = size;
+      const uint64_t readOffset = c.offset + c.pending.size();
+      if (readOffset < size && budget) {
+        size_t window = std::max<size_t>(256 * 1024, c.pending.size());
+        auto data = readAt(
+            readOffset,
+            (size_t)std::min<uint64_t>({size - readOffset, budget, window}));
+        c.pending.insert(c.pending.end(), data.begin(), data.end());
+      }
+      size_t used = 0;
+      bool incomplete = false;
+      const auto deadline =
+          std::chrono::steady_clock::now() + std::chrono::milliseconds(8);
       if (compressed) {
-        const auto decodeDeadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
-        while (used < input.size() &&
-               std::chrono::steady_clock::now() < decodeDeadline) {
-          auto frame = ZSTD_findFrameCompressedSize(input.data() + used,
-                                                    input.size() - used);
+        while (used < c.pending.size() &&
+               std::chrono::steady_clock::now() < deadline) {
+          auto frame = ZSTD_findFrameCompressedSize(c.pending.data() + used,
+                                                    c.pending.size() - used);
           if (ZSTD_isError(frame)) {
             if (ZSTD_getErrorCode(frame) != ZSTD_error_srcSize_wrong)
-              throw std::runtime_error("corrupt zstd frame");
+              throw std::runtime_error("corrupt frame");
+            incomplete = true;
             break;
-          } // writer's incomplete tail: retry from this boundary
-          auto length = ZSTD_getFrameContentSize(input.data() + used, frame);
-          if (length == ZSTD_CONTENTSIZE_ERROR)
-            throw std::runtime_error("invalid zstd frame");
-          if (length == ZSTD_CONTENTSIZE_UNKNOWN)
-            length = 4 * 1024 * 1024;
-          if (length > 4 * 1024 * 1024)
-            throw std::runtime_error("Harness frame exceeds budget");
-          std::vector<char> decoded((size_t)length);
-          auto output = ZSTD_decompress(decoded.data(), decoded.size(),
-                                        input.data() + used, frame);
-          if (ZSTD_isError(output) || records(decoded.data(), output) != output)
-            throw std::runtime_error("invalid Harness frame");
+          }
+          decode(c.fold, c.pending.data() + used, frame);
           used += frame;
         }
       } else
-        used = records(input.data(), input.size());
-      if (used == 0 && input.size() == 4 * 1024 * 1024)
-        throw std::runtime_error("Harness record exceeds budget");
+        used = records(c.fold, c.pending.data(), c.pending.size());
+      c.bufferedReady = !incomplete && used < c.pending.size();
       c.offset += used;
+      c.pending.erase(c.pending.begin(), c.pending.begin() + used);
+      if (c.pending.size() > 4 * 1024 * 1024)
+        throw std::runtime_error("oversize compressed record");
       c.written = info.ftLastWriteTime;
-      // Never publish an intermediate historical state while catching up.
-      c.fold.s.uncertain = c.offset < size;
+      if (c.offset >= c.target ||
+          (incomplete && c.offset + c.pending.size() == size)) {
+        c.fold.s.uncertain = false;
+        c.published = c.fold;
+        c.target = size;
+      }
+      c.fold.s.uncertain = !c.published && c.offset < size;
     } catch (...) {
       c.failed = true;
       c.observedSize = size;
@@ -277,17 +419,22 @@ struct Reader {
          serviced < paths.size() && std::chrono::steady_clock::now() < deadline;
          ++serviced) {
       const auto &p = paths[(nextRead + serviced) % paths.size()];
+      if(!budget && cursors.at(p).pending.empty())break;
       if (!Read(p, cursors.at(p), budget))
         cursors.erase(p);
     }
+    deferred=serviced<paths.size();
     if (!paths.empty())
       nextRead = (nextRead + serviced) % paths.size();
     for (auto it = cursors.begin(); it != cursors.end();) {
       auto &c = it->second;
       if (c.failed)
-        out.error = L"会话格式不支持、损坏或单条记录超过 4 MiB";
+        out.error = L"会话格式不支持、损坏或单条记录过大";
       if (c.fold.header && !c.fold.hidden) {
-        auto s = c.fold.s;
+        auto s = c.published ? c.published->s : c.fold.s;
+        s.catchingUp = c.offset < size_t(c.target);
+        if (c.failed)
+          s.uncertain = true;
         if (!online || (s.running && s.startedAt < processStart)) {
           s.running = false;
           s.waiting = false;
@@ -359,7 +506,14 @@ Snapshot ObserveDeepSeek(const fs::path &root) {
     reader.root = root / L"sessions";
   }
   const auto start = HarnessStart();
-  return reader.Poll(start != 0, start);
+  auto result = reader.Poll(start != 0, start);
+  bool backlog = reader.deferred || reader.scan != reader.end;
+  for (const auto &[path, c] : reader.cursors)
+    if (!c.failed && ((!c.fold.header && c.target == 0) || c.bufferedReady ||
+                      c.offset + c.pending.size() < c.target))
+      backlog = true;
+  SetHarnessBacklog(backlog);
+  return result;
 }
 bool FoldTests() {
   Fold f;
@@ -448,7 +602,7 @@ bool DataSourceTests(bool benchmark) {
   if (r.bytes != bytes || r.parses != parses)
     return false;
   if (!write(ended.substr(0, ended.size() - 2), true) ||
-      !r.Read(path, c, budget) || !c.fold.s.uncertain)
+      !r.Read(path, c, budget) || (!c.published || !c.published->s.running))
     return false;
   if (!write(ended.substr(ended.size() - 2), true) ||
       !r.Read(path, c, budget) || c.fold.s.result != L"completed" ||
@@ -471,6 +625,83 @@ bool DataSourceTests(bool benchmark) {
       96);
   if (!write(entropy) || !r.Read(path, c, budget) || c.failed ||
       c.fold.s.id != L"entropy" || !c.fold.s.running)
+    return false;
+
+  // 64 MiB of old assistant payload must not be replayed to find a recent end.
+  const auto header = Frame("{\"type\":\"session\",\"version\":4,\"id\":"
+                            "\"large\",\"createdAt\":1}\n");
+  const auto filler =
+      Frame("{\"type\":\"assistant/message\",\"time\":5,\"data\":{\"text\":\"" +
+            std::string(4096, 'x') + "\"}}\n");
+  {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f << header;
+    for (int i = 0; i < 16384; ++i)
+      f << filler;
+    f << ended;
+  }
+  c = Cursor{};
+  Reader large;
+  budget = 4 * 1024 * 1024;
+  if (!large.Read(path, c, budget) || c.failed || !c.published ||
+      c.published->s.result != L"completed" || large.bytes > 3 * 1024 * 1024)
+    return false;
+  const auto readBefore = large.bytes;
+  budget = 4 * 1024 * 1024;
+  const auto next =
+      Frame("{\"type\":\"turn/start\",\"time\":30,\"data\":{\"turn\":2}}\n");
+  if (!write(next, true) || !large.Read(path, c, budget) ||
+      !c.published->s.running || large.bytes - readBefore > 1024)
+    return false;
+  // Buffered work must progress even after another source exhausted the I/O
+  // budget.
+  const auto finish = Frame("{\"type\":\"turn/"
+                            "end\",\"time\":40,\"data\":{\"turn\":2,\"reason\":"
+                            "{\"kind\":\"completed\"}}}\n");
+  if (!write(finish, true))
+    return false;
+  c.pending.assign(finish.begin(), finish.end());
+  budget = 0;
+  const auto cachedBytes = large.bytes;
+  if (!large.Read(path, c, budget) || large.bytes != cachedBytes ||
+      !c.published || c.published->s.result != L"completed" ||
+      !c.pending.empty())
+    return false;
+  if (benchmark) {
+    std::ofstream f("source-benchmark.txt", std::ios::app);
+    f << "large_history_bytes=" << fs::file_size(path)
+      << "\nbootstrap_bytes=" << readBefore
+      << "\nappend_bytes=" << large.bytes - readBefore << "\n";
+  }
+
+  const auto third =
+      Frame("{\"type\":\"turn/start\",\"time\":50,\"data\":{\"turn\":3}}\n");
+  if (!write(third, true))
+    return false;
+  {
+    std::ofstream f(path, std::ios::binary | std::ios::app);
+    for (int i = 0; i < 2048; ++i)
+      f << filler;
+  }
+  for (int round = 0; round < 4; ++round) {
+    {
+      std::ofstream f(path, std::ios::binary | std::ios::app);
+      for (int i = 0; i < 16; ++i)
+        f << filler;
+    }
+    budget = 4 * 1024 * 1024;
+    if (!large.Read(path, c, budget) || c.failed || !c.published ||
+        c.published->s.uncertain || !c.published->s.running)
+      return false;
+  }
+  const auto finalEnd = Frame("{\"type\":\"turn/"
+                              "end\",\"time\":60,\"data\":{\"turn\":3,"
+                              "\"reason\":{\"kind\":\"completed\"}}}\n");
+  if (!write(finalEnd, true))
+    return false;
+  budget = 4 * 1024 * 1024;
+  if (!large.Read(path, c, budget) || c.failed || !c.published ||
+      c.published->s.result != L"completed" || c.published->s.turnId != L"3")
     return false;
   return true;
 }
