@@ -13,7 +13,7 @@ Harness 的官方来源依据为 [deepseek-ai/deepseek-harness](https://github.c
 
 Harness 行显示 `DS ·` 标识；内部来源字段和独立 workspace 命名空间避免与 ZCode 混淆。完成事件复用现有提醒和宠物动作。为了不把进程重启前未结束的旧 turn 当作当前工作，运行态需要匹配当前 Harness 窗口进程的启动时间；没有识别到桌面进程时保留历史会话并标为不确定。不会仅凭有一个未结束 turn 就宣称进程仍在运行。
 
-限制：已从官方源码构建 Desktop，并在独立开发目录通过官方 headless profile 访问本地 Mock Chat API；实测同一会话新 turn 的运行→完成、完成气泡和宠物完成动作。Desktop 已进入工作区并显示 Mock Chat 模型；桌面输入框发送与生产安装包尚未验收。该读取方式依赖持久化检查点，官方未刷盘的活动可能延迟出现；不代表实时运行内存状态。当前适配当前格式 v4，不负责历史格式迁移、自定义插件状态投影、归档数据库或多 profile 合并。Harness 点击标题/提醒正文通过 UIA 定位“会话 / Sessions”树中的可聚焦 TreeItem，再调用 Invoke、默认动作或只向确切条目发送 Enter。只接受已验证的 Harness 窗口；同名会话拒绝猜选，折叠、未挂载或离屏条目返回提示。ZCode 仍使用原有项目分组/ListItem 路径。
+限制：已从官方源码构建 Desktop，并在独立开发目录通过官方 headless profile 访问本地 Mock Chat API；实测同一会话新 turn 的运行→完成、完成气泡和宠物完成动作。Desktop 已进入工作区并显示 Mock Chat 模型；桌面输入框发送与生产安装包尚未验收。该读取方式依赖持久化检查点，官方未刷盘的活动可能延迟出现；不代表实时运行内存状态。当前适配当前格式 v4，不负责历史格式迁移、自定义插件状态投影、归档数据库或多 profile 合并。Harness 点击标题/提醒正文通过 UIA 定位“会话 / Sessions”树中的 TreeItem（不要求键盘可聚焦），优先调用 SelectionItemPattern::Select；不支持该模式时回退到 Invoke、默认动作或只向确切条目发送 Enter。名称匹配兼容“进行中 + 标题 + 时间”等已知状态装饰，并拒绝可能对应其他已知会话的名称。只接受已验证的 Harness 窗口；同名会话拒绝猜选，折叠、未挂载或离屏条目返回提示。ZCode 仍使用原有项目分组/ListItem 路径。
 
 性能边界：无需安装插件或额外配置。启动只枚举一次投影缓存目录，之后使用 ReadDirectoryChangesW 返回的具体文件名读取变化的小缓存；不递归遍历 sessions，不定时重扫缓存目录。只有 Windows 通知缓冲溢出时重新对账，缓存静默时不重复读取正文。最多保留最近 80 个缓存记录和游标，展示最多 40 个会话。
 
@@ -37,7 +37,7 @@ Harness 行显示 `DS ·` 标识；内部来源字段和独立 workspace 命名�
 
 `--data-sources-test` 增加约 65 MiB 历史、追加事件、持续增长、零 I/O 预算时消费已有缓存的回归。`--source-benchmark` 实测历史文件 68,239,672 字节，近期状态初始化读取 2,162,688 字节；下一条事件追加读取 62 字节，静默检查不读取正文。数字为合成日志读取器测试，不代表所有真实日志、CPU 或磁盘性能。
 
-`--harness-navigation-smoke` 为手动测试入口：会打开真实 Harness 侧栏唯一的“新会话”条目，不能放进无人值守 CTest。本机源码 Desktop 上返回 Opened、唯一匹配 1 个；模型测试另覆盖 Harness 同名拒绝和不依赖目录名的定位准备。未自动展开或滚动列表，也未验证其他语言的会话树名称。
+`--harness-navigation-smoke` 为手动测试入口：会打开真实 Harness 侧栏唯一的“新会话”条目，不能放进无人值守 CTest。本机源码 Desktop 上返回 Opened、唯一匹配 1 个，实际动作是 SelectionItemPattern::Select；模型测试另覆盖 Harness 同名拒绝和不依赖目录名的定位准备。未自动展开或滚动列表，也未验证其他语言的会话树名称。
 
 
 无需插件路径回归：新增缓存版本/身份/seq 校验、目录通知驱动的改名更新，以及连续空闲 Poll 不新增缓存正文读取的测试。本机源码 Harness 开发数据通过缓存索引发现 3 个会话，15 秒诊断稳定为 2 个完成、0 个未知、0 个来源警告。单 EXE 保留，未安装或修改 Harness 插件。

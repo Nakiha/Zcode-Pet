@@ -174,6 +174,9 @@ ListRow(IUIAutomation *uia, IUIAutomationElement *text, bool tree = false) {
     node->get_CurrentControlType(&type);
     if (type ==
         (tree ? UIA_TreeItemControlTypeId : UIA_ListItemControlTypeId)) {
+      // Harness tree membership is checked separately. Chromium exposes
+      // SelectionItem even when IsKeyboardFocusable is false.
+      if (tree) return node;
       BOOL focusable = FALSE;
       node->get_CurrentIsKeyboardFocusable(&focusable);
       // 普通对话正文的 li 不可聚焦，不能把正文中的同名文本当作侧栏会话。
@@ -308,6 +311,18 @@ NavigationResult Open(IUIAutomation *uia, const Session &session,
     return {NavigationCode::NotFound, count};
   if (stopping || !Foreground(match.window))
     return {NavigationCode::FocusFailed, count};
+  if (session.source == SourceId::DeepSeek) {
+    ComPtr<IUIAutomationSelectionItemPattern> selection;
+    if (SUCCEEDED(match.row->GetCurrentPatternAs(UIA_SelectionItemPatternId,
+                                                IID_PPV_ARGS(&selection))) && selection) {
+      if (stopping || !Foreground(match.window))
+        return {NavigationCode::FocusFailed, count};
+      // Do not retry a different activation after an action with unknown result.
+      return {SUCCEEDED(selection->Select()) ? NavigationCode::Opened
+                                             : NavigationCode::AutomationFailed,
+              count, NavigationAction::Select};
+    }
+  }
   ComPtr<IUIAutomationInvokePattern> invoke;
   if (SUCCEEDED(match.row->GetCurrentPatternAs(UIA_InvokePatternId,
                                                IID_PPV_ARGS(&invoke))) &&
@@ -463,7 +478,7 @@ bool HarnessNavigationSmoke() {
   target.workspace = L"deepseek:smoke";
   target.title = L"新会话";
   auto result = Open(automation.Get(), target, {target});
-  std::ofstream report("harness-navigation-smoke.txt");report<<(int)result.code<<","<<result.matches<<","<<scanWindows<<","<<scanTitles<<","<<scanRows;
+  std::ofstream report("harness-navigation-smoke.txt");report<<(int)result.code<<","<<result.matches<<","<<scanWindows<<","<<scanTitles<<","<<scanRows<<","<<(int)result.action;
   automation.Reset();
   CoUninitialize();
   return result.code == NavigationCode::Opened;

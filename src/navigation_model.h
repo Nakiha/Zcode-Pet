@@ -20,7 +20,7 @@ enum class NavigationCode {
   Cancelled,
   UnsupportedSource
 };
-enum class NavigationAction { None, Invoke, Legacy, Keyboard };
+enum class NavigationAction { None, Invoke, Legacy, Keyboard, Select };
 struct NavigationResult {
   NavigationCode code = NavigationCode::Idle;
   int matches = 0;
@@ -46,7 +46,7 @@ inline std::wstring NavigationProjectName(const Session &session) {
   return session.projectMetadataKnown ? session.projectDisplayName
                                       : ProjectName(session.path);
 }
-inline bool AccessibleSessionName(const std::wstring &name, const Session &target,
+inline bool BareAccessibleSessionName(const std::wstring &name, const Session &target,
                                   const std::vector<Session> &peers) {
   if (target.title.empty() || !name.starts_with(target.title))
     return false;
@@ -73,6 +73,38 @@ inline bool AccessibleSessionName(const std::wstring &name, const Session &targe
     if (unit == allowed)
       return true;
   return false;
+}
+// Chromium concatenates status icon labels, title and relative time into Name.
+// Only strip known leading status labels, never search arbitrary substrings.
+inline bool AccessibleSessionName(const std::wstring &name, const Session &target,
+                                  const std::vector<Session> &peers) {
+  if (target.source != SourceId::DeepSeek)
+    return BareAccessibleSessionName(name, target, peers);
+  std::vector<std::wstring> candidates{name};
+  for (const auto *status : {L"进行中", L"空闲", L"等待审批", L"计划待审",
+                            L"等待回答", L"待审批", L"待回答", L"已完成",
+                            L"Running", L"Idle", L"Waiting for approval",
+                            L"Plan awaiting review", L"Waiting for answer",
+                            L"Approval", L"Plan review", L"Answer", L"Completed"}) {
+    std::wstring prefix(status);
+    if (!name.starts_with(prefix)) continue;
+    auto tail = name.substr(prefix.size());
+    while (!tail.empty() && iswspace(tail.front())) tail.erase(0, 1);
+    candidates.push_back(std::move(tail));
+  }
+  bool matches = false;
+  for (const auto &candidate : candidates)
+    matches |= BareAccessibleSessionName(candidate, target, {});
+  if (!matches) return false;
+  // Include peers in all workspaces: Harness trees are not grouped by project.
+  // A real title may itself start with a status label or end with digits.
+  for (const auto &peer : peers)
+    if (peer.source == target.source && !SameSession(peer, target))
+      for (const auto &candidate : candidates)
+        if (BareAccessibleSessionName(candidate, peer, {}) ||
+            (peer.title.size() > target.title.size() &&
+             candidate.starts_with(peer.title))) return false;
+  return true;
 }
 struct NavigationPreparation {
   NavigationCode code;
@@ -106,6 +138,19 @@ inline int SessionRowAt(float y, float height, int scroll, size_t count) {
 }
 inline bool NavigationModelTests() {
   Session harness;harness.id=L"ds";harness.source=SourceId::DeepSeek;harness.workspace=L"deepseek:default";harness.title=L"标题";
+  harness.title = L"test";
+  if (!AccessibleSessionName(L"进行中 test 52分钟", harness, {harness}) ||
+      !AccessibleSessionName(L"进行中test52分钟", harness, {harness}) ||
+      !AccessibleSessionName(L"已完成 test 2分", harness, {harness}) ||
+      !AccessibleSessionName(L"test", harness, {harness}) ||
+      AccessibleSessionName(L"其他 test 52分钟", harness, {harness}) ||
+      AccessibleSessionName(L"进行中 testing 52分钟", harness, {harness}))
+    return false;
+  auto prefixed = harness; prefixed.id=L"prefix"; prefixed.title=L"进行中 test";
+  auto numeric = harness; numeric.id=L"numeric"; numeric.title=L"test52";
+  if (AccessibleSessionName(L"进行中 test 52分钟", harness, {prefixed}) ||
+      AccessibleSessionName(L"进行中test52分钟", harness, {numeric}))
+    return false;
   Snapshot ds;ds.online=true;ds.sessions={harness};
   if(PrepareNavigation(harness,ds).code!=NavigationCode::Idle)return false;
   auto duplicate=harness;duplicate.id=L"other";duplicate.workspace=L"another";ds.sessions.push_back(duplicate);
