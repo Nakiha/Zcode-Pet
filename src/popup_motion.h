@@ -125,6 +125,7 @@ inline bool PopupPlacementTests() {
 void PlacePopup(HWND window, POINT anchor, SIZE size);
 void RepositionPopupAnimated(HWND window, POINT anchor, SIZE size);
 void SnapPopupPlacement(HWND window);
+void FreezePopupPlacement(HWND window);
 void ShowPopupAnimated(HWND window, POINT anchor, float scale);
 void HidePopupAnimated(HWND window, float scale);
 void HidePopupImmediately(HWND window);

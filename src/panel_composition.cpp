@@ -30,6 +30,7 @@ struct PanelComposition::Impl {
     float scale = 0;
     ContainerVisual root{nullptr};
     SpriteVisual glow{nullptr}, arc{nullptr};
+    CompositionPropertySet glowGeometry{nullptr};
     bool shimmer = false, spinner = false;
   };
   bool attempted = false, ready = false;
@@ -133,7 +134,8 @@ struct PanelComposition::Impl {
     visual.StartAnimation(L"RotationAngleInDegrees", angle);
     return visual;
   }
-  SpriteVisual Glow(const ComposedSession &row, float scale) {
+  SpriteVisual Glow(const ComposedSession &row, float scale,
+                    CompositionPropertySet &geometry) {
     const float left = std::floor(row.x * scale),
                 top = std::floor(row.y * scale);
     const int width = (int)std::ceil((row.x + row.width) * scale) - (int)left,
@@ -167,7 +169,9 @@ struct PanelComposition::Impl {
     stop(.75f, 31);
     stop(1, 0);
     const float band = 56 * scale, span = row.span * scale;
-    auto geometry = compositor.CreatePropertySet();
+    // Explicitly own every expression dependency for the visual's lifetime;
+    // do not leave this property set in a function-local wrapper.
+    geometry = compositor.CreatePropertySet();
     geometry.InsertScalar(L"origin", x * scale);
     geometry.InsertScalar(L"band", band);
     geometry.InsertScalar(L"span", span);
@@ -203,6 +207,7 @@ struct PanelComposition::Impl {
       source.StopAnimation(L"StartPoint");
       source.StopAnimation(L"EndPoint");
     }
+    node.glowGeometry = nullptr;
   }
   void Clear() {
     if (root)
@@ -348,7 +353,7 @@ HRESULT PanelComposition::Update(const std::vector<ComposedSession> &rows,
         node.spinner = spinner;
         node.root = s.compositor.CreateContainerVisual();
         if (shimmer && row.width > 0 && row.layout) {
-          node.glow = s.Glow(row, scale);
+          node.glow = s.Glow(row, scale, node.glowGeometry);
           node.root.Children().InsertAtTop(node.glow);
         }
         if (spinner) {
@@ -448,6 +453,13 @@ bool PanelCompositionTests() {
         check_hresult(composition.Update(rows, 312, 102, 1.75f, true, true));
       };
       update();
+      const auto geometryIdentity =
+          get_abi(composition.impl->nodes.at(L"one").glowGeometry);
+      passed &= geometryIdentity != nullptr;
+      float band = 0;
+      passed &= composition.impl->nodes.at(L"one").glowGeometry.TryGetScalar(
+                    L"band", band) == CompositionGetValueStatus::Succeeded &&
+                std::abs(band - 56 * 1.75f) < .001f;
       check_hresult(
           composition.PaintBase(312, 102, 1.75f, [](ID2D1RenderTarget *canvas) {
             canvas->Clear(D2D1::ColorF(0, 0.f));
@@ -459,6 +471,8 @@ bool PanelCompositionTests() {
       for (int i = 0; i < 200; ++i) {
         rows[0].indicatorY = 17.f + (float)(i % 3);
         update();
+        passed &= get_abi(composition.impl->nodes.at(L"one").glowGeometry) ==
+                  geometryIdentity;
       }
       passed &=
           composition.Metric(2) == uploads && composition.Metric(3) == starts;
@@ -475,7 +489,7 @@ bool PanelCompositionTests() {
       passed &= composition.Metric(2) == uploads + 4 &&
                 composition.Metric(3) == starts;
       composition.Suspend();
-      passed &= composition.Metric(5) == 0;
+      passed &= composition.Metric(5) == 0 && composition.impl->nodes.empty();
       update();
       passed &=
           composition.Metric(3) == starts + 2 && composition.Metric(5) == 1;

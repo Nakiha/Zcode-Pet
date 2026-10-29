@@ -17,6 +17,7 @@ struct ComposedSession {
 // The compositor owns animation time. Updating a row's age or hover must never
 // restart its repeating animations or rasterize its stationary glyph mask.
 class PanelComposition {
+  friend bool PanelCompositionTests();
   struct Impl;
   std::unique_ptr<Impl> impl;
 

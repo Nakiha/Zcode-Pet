@@ -55,7 +55,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-需要 Visual Studio C++ 和 Windows SDK（本机 10.0.26100）。构建时刷新专属输出目录内的 assets，避免旧素材残留。15 项 CTest 覆盖观察器、展示、字形、边界/避让、浮层和交互动效、导航、提醒、保留式合成、栅格边界、Spine 状态/资源生命周期和时钟节拍。
+需要 Visual Studio C++ 和 Windows SDK（本机 10.0.26100）。构建时刷新专属输出目录内的 assets，避免旧素材残留。16 项 CTest 覆盖观察器、展示、字形、边界/避让、浮层和交互动效、导航、提醒、保留式合成、栅格边界、Spine 状态/资源生命周期和时钟节拍。
 
 - `--probe`：只读检查运行实例，写 EXE 旁的 `probe.txt`，包含实际后端、错误计数、帧率需求、托盘注册及会话行数，不输出会话内容。
 - `--panel` / `--quit`：展开面板启动 / 正常退出已运行实例。

@@ -1025,8 +1025,15 @@ void PlaceFloating(HWND window, float logicalWidth, float logicalHeight,
       (LONG)std::ceil(8 * GetDpiForWindow(pet) / 96.f));
   PlacePopup(window, destination, {w, h});
 }
+bool NoticeExitInProgress() {
+  return std::any_of(notices.begin(), notices.end(), [](const auto &notice) {
+    return notice->closing && IsWindowVisible(notice->window);
+  });
+}
 void PlaceNoticeWindows(bool snap = false) {
   if (!pet)
+    return;
+  if (!snap && NoticeExitInProgress())
     return;
   const float scale = GetDpiForWindow(pet) / 96.f;
   const int edge = FloatingScreenPadding(scale),
@@ -1145,6 +1152,8 @@ void UpdateAnimation() {
                              [](const auto &s) { return s.waiting; })));
 }
 void ShowIncomingNotices() {
+  if (NoticeExitInProgress())
+    return; // Queue arrivals until retiring windows have released their slots.
   std::vector<HWND> added;
   while (!incomingNotices.empty()) {
     NoticeRecord record{std::move(incomingNotices.front())};
@@ -1191,9 +1200,11 @@ void CloseNotice(HWND window) {
   RetireNoticeClose(window);
   SetInteractionFeedback(window, L"body", {}, 0);
   HidePopupAnimated(window, notice->scale);
-  // 某条补位中的气泡关闭后，将其当前位置作为退场障碍重新规划，
-  // 防止后面的气泡继续驶向被它暂时占用的路径。
-  PlaceNoticeWindows();
+  // Do not route survivors around a temporary closing-window obstacle, then
+  // route them back again. Hold current positions until all exits complete.
+  for (const auto &other : notices)
+    if (!other->closing)
+      FreezePopupPlacement(other->window);
   RefreshToolbarPlacement();
 }
 void ReapNotices() {
@@ -1212,9 +1223,79 @@ void ReapNotices() {
       ++i;
   }
   if (removed) {
+    if (!NoticeExitInProgress())
+      ShowIncomingNotices();
     PlaceNoticeWindows();
     RefreshToolbarPlacement();
   }
+}
+bool NoticeReflowTests() {
+  SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+  WNDCLASSW type{};
+  type.hInstance=GetModuleHandleW(nullptr);
+  type.lpfnWndProc=DefWindowProcW;
+  type.lpszClassName=L"ZCodePet.ReflowFixture";
+  RegisterClassW(&type);
+  RECT work{};
+  if (!SystemParametersInfoW(SPI_GETWORKAREA,0,&work,0))
+    return false;
+  auto make=[&](int x,int y,int w,int h) {
+    auto window=CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_LAYERED,type.lpszClassName,
+        L"",WS_POPUP,x,y,w,h,nullptr,nullptr,type.hInstance,nullptr);
+    SetLayeredWindowAttributes(window,0,0,LWA_ALPHA);
+    return window;
+  };
+  const int center=(work.left+work.right)/2;
+  pet=make(center-40,work.bottom-100,80,80);
+  panel=make(center-200,work.bottom-250,400,120);
+  bool okay=pet && panel;
+  ShowWindow(pet,SW_SHOWNOACTIVATE);
+  ShowWindow(panel,SW_SHOWNOACTIVATE);
+  auto rect=[](HWND window){RECT r{};GetWindowRect(window,&r);return r;};
+  for(bool closeUpper : {true,false}) {
+    for(int i=0;i<2;++i) {
+      auto notice=std::make_unique<NoticeSurface>();
+      notice->window=make(0,0,1,1);
+      okay &= notice->window!=nullptr;
+      notices.push_back(std::move(notice));
+    }
+    PlaceNoticeWindows(true);
+    for(const auto &notice:notices) {
+      ShowPopupAnimated(notice->window,notice->destination,notice->scale);
+      SnapPopupPlacement(notice->window);
+    }
+    const HWND upper=rect(notices[0]->window).top<rect(notices[1]->window).top
+                        ? notices[0]->window : notices[1]->window;
+    const HWND lower=upper==notices[0]->window ? notices[1]->window : notices[0]->window;
+    const HWND closing=closeUpper ? upper : lower, survivor=closeUpper ? lower : upper;
+    const auto before=rect(survivor);
+    CloseNotice(closing);
+    // Simulate an observer/rename layout pass while the other window exits.
+    PlaceNoticeWindows();
+    const auto during=rect(survivor);
+    okay &= before.left==during.left && before.top==during.top;
+    HidePopupImmediately(closing);
+    ReapNotices();
+    const auto started=rect(survivor);
+    okay &= before.left==started.left && before.top==started.top;
+    LONG last=started.top;
+    for(int frame=0;frame<30;++frame) {
+      Sleep(10);
+      PulsePopupAnimations();
+      const auto current=rect(survivor);
+      okay &= current.left==before.left;
+      okay &= closeUpper ? current.top==before.top : current.top>=last;
+      last=current.top;
+    }
+    if(!closeUpper) okay &= last>before.top;
+    ForgetPopupAnimation(survivor);
+    ClearInteractionFeedback(survivor);
+    DestroyWindow(survivor);
+    notices.clear();
+  }
+  DestroyWindow(panel);DestroyWindow(pet);panel=pet=nullptr;
+  ClearPopupAnimations();ClearAllInteractionFeedback();
+  return okay;
 }
 void UpdateNoticeHovers() {
   POINT p;
@@ -1956,6 +2037,7 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   return DefWindowProcW(h, msg, w, l);
 }
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
+  if(wcsstr(command,L"--notice-reflow-test"))return NoticeReflowTests() ? 0 : 1;
   if(wcsstr(command,L"--frame-clock-test"))return FrameClockTimingTests() ? 0 : 1;
   if(wcsstr(command,L"--raster-test"))return SoftwareRasterTests() ? 0 : 1;
   if (wcsstr(command,L"--composition-test")) return PanelCompositionTests() ? 0 : 1;

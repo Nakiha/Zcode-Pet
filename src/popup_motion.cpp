@@ -149,6 +149,16 @@ void SnapPopupPlacement(HWND window) {
                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
   UpdateActivity();
 }
+void FreezePopupPlacement(HWND window) {
+  auto &motion = State(window);
+  const double now = Now();
+  motion.placement.Freeze(now);
+  motion.anchor = {(LONG)std::lround(motion.placement.target.x),
+                   (LONG)std::lround(motion.placement.target.y)};
+  motion.lastPlacementFrame = 0;
+  Apply(window, motion, now);
+  UpdateActivity();
+}
 void ShowPopupAnimated(HWND window, POINT anchor, float scale) {
   auto &motion = State(window);
   if (motion.tween.target == 1 && IsWindowVisible(window))
