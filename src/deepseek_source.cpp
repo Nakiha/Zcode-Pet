@@ -386,6 +386,7 @@ struct Reader {
       c.bufferedReady = !incomplete && used < c.pending.size();
       c.offset += used;
       c.pending.erase(c.pending.begin(), c.pending.begin() + used);
+      if(c.pending.empty() && c.pending.capacity()>256*1024)std::vector<char>().swap(c.pending);
       if (c.pending.size() > 4 * 1024 * 1024)
         throw std::runtime_error("oversize compressed record");
       c.written = info.ftLastWriteTime;
