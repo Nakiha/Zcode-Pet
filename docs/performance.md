@@ -21,3 +21,14 @@
 `scripts/profile-gpu.ps1` 使用本地固定场景，输出 `summary.json/csv` 和 `engine-samples.csv`，不写 ZCode、不记录会话内容、不保存诊断材质偏好，结束后恢复普通运行实例。采样时应记录显示器刷新率、GPU 时钟、流媒体采集和桌面活动。
 
 可对照 `running` / `running-legacy`、`running-spine-gpu`、`running-no-shimmer`、`running-no-spinner`、`running-mica`、`running-solid`、`running-frozen`。`pet-frozen` 用于静态角色基线。应用计数与整卡/整个桌面的计数应分别解释。
+## 0.2.5 CPU 观察侧优化
+
+本机 16 逻辑处理器、默认 224 px 角色、真实数据约 461 条 message / 1720 条 part、当日日志约 1.2 MiB。独立连续观察微基准 24 次：单次墙钟耗时平均约 13.51 ms → 3.37 ms（约减少 75%）；进程检测约 6.18 ms → 0.49 ms，日志约 0.50 ms → 0.10 ms。该轮无等待查询的合格当前回合，旧全历史提问扫描约 3.91 ms，新路径跳过该查询。
+
+三轮独立运行 24 次观察的整个进程 CPU 总耗时（包含诊断进程启动）为旧版 390.62 / 312.50 / 312.50 ms，新版 46.88 / 15.62 / 31.25 ms。这是观察诊断进程的对照，不能当成整个桌宠同幅降低。CPU 时间计数有约 15.6 ms 量化，单次 cpuUs 列不适合独立解释。
+
+正常桌宠展开面板、每版 120 个约 100 ms 样本：平均 CPU 0.446% → 0.408%，最大短样本约 1.81% / 1.82%，P95 约 0.91% / 1.78%。短采样受计数量化、调度和角色动画节奏影响，不据此声称峰值下降；本机未复现用户报告的 5% 尖峰。角色软件栅格化仍有逐帧 CPU 成本，角色尺寸、机器和历史数据量都会影响结果。
+
+实现：从经过可执行文件名校验的 ZCode 主窗口定位进程，无普通窗口时仍回退进程枚举；日志用文件身份、大小、修改时间和已读边界短签名识别追加/截断/替换，只解析新增完整行；当前回合的提问查询先限定 message_id，再使用现有 session/message 索引检索 part。无合格回合则不查询，不对用户库建索引、不改变两秒观察周期，不减少角色或 UI 动效帧率。
+
+复测：`ZCodePet.exe --observer-benchmark` 在 EXE 旁写仅含阶段耗时与错误/在线标记的 observer-benchmark.csv；不含会话或日志内容。`scripts/profile-cpu.ps1 -BeforeExe <旧版EXE> -AfterExe <新版EXE> -OutputDirectory <输出目录>` 采集正常实例短间隔 CPU，最后默认恢复新版路径，可用 -RestoreExe 指定恢复实例。

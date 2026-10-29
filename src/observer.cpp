@@ -12,6 +12,13 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 namespace {
+thread_local ObserverTiming timing;
+uint64_t Microseconds() {
+  LARGE_INTEGER ticks, frequency;
+  QueryPerformanceCounter(&ticks);
+  QueryPerformanceFrequency(&frequency);
+  return (uint64_t)(ticks.QuadPart * 1000000. / frequency.QuadPart);
+}
 std::wstring Wide(const std::string &s) {
   if (s.empty())
     return {};
@@ -104,50 +111,69 @@ std::wstring RecapFromDb(Sqlite &sql, const Session &session) {
     return {};
   return CompactPreview(text);
 }
-void ReadQuestionsFromDb(Sqlite &sql, Snapshot &snapshot) {
-  if (!snapshot.online)
-    return;
-  const char *query =
+const char *QuestionQuery() {
+  return
       R"SQL(SELECT p.session_id,json_extract(m.data,'$.anchor.turnId'),
  json_extract(p.data,'$.callID'),json_extract(p.data,'$.state.status'),
  json_extract(p.data,'$.state.time.start'),json_extract(p.data,'$.state.time.end'),
  json_extract(p.data,'$.state.input.questions[0].question')
  FROM part p JOIN message m ON m.id=p.message_id AND m.session_id=p.session_id
- WHERE json_extract(p.data,'$.type')='tool' AND json_extract(p.data,'$.tool')='AskUserQuestion'
+ WHERE p.message_id IN (SELECT id FROM message WHERE session_id=?1
+ AND json_extract(data,'$.anchor.turnId')=?2)
+ AND p.session_id=?1 AND m.session_id=?1
+ AND json_extract(m.data,'$.anchor.turnId')=?2
+ AND json_extract(p.data,'$.type')='tool' AND json_extract(p.data,'$.tool')='AskUserQuestion'
  ORDER BY p.time_updated DESC LIMIT 128)SQL";
-  void *stmt = nullptr;
-  if (sql.prepare(sql.db, query, -1, &stmt, nullptr) != 0)
+}
+void ReadQuestionsFromDb(Sqlite &sql, Snapshot &snapshot) {
+  if (!snapshot.online || !sql.bind)
     return;
-  while (sql.step(stmt) == 100) {
-    auto id = sql.text(stmt, 0), turn = sql.text(stmt, 1),
-         request = sql.text(stmt, 2), status = sql.text(stmt, 3);
-    if (turn.empty() || request.empty())
+  const char *query = QuestionQuery();
+  for (auto &current : snapshot.sessions) {
+    if (current.turnId.empty() || current.endedAt || !current.startedAt ||
+        std::count_if(snapshot.sessions.begin(), snapshot.sessions.end(),
+                      [&](const auto &s) { return s.id == current.id; }) != 1)
       continue;
-    for (auto &s : snapshot.sessions) {
-      if (s.id != id || s.turnId != turn || s.endedAt || !s.startedAt)
+    void *stmt = nullptr;
+    if (sql.prepare(sql.db, query, -1, &stmt, nullptr) != 0)
+      return;
+    const auto sessionId = Utf8(current.id), turnId = Utf8(current.turnId);
+    if (sql.bind(stmt, 1, sessionId.c_str(), -1, nullptr) != 0 ||
+        sql.bind(stmt, 2, turnId.c_str(), -1, nullptr) != 0) {
+      sql.finalize(stmt);
+      continue;
+    }
+    while (sql.step(stmt) == 100) {
+      auto id = sql.text(stmt, 0), turn = sql.text(stmt, 1),
+           request = sql.text(stmt, 2), status = sql.text(stmt, 3);
+      if (turn.empty() || request.empty())
         continue;
-      if (std::count_if(snapshot.sessions.begin(), snapshot.sessions.end(),
-                        [&](const auto &x) { return x.id == id; }) != 1)
-        continue;
-      if (status == L"running") {
-        auto since = sql.integer(stmt, 4);
-        if (since < s.startedAt || s.waiting)
+      for (auto &s : snapshot.sessions) {
+        if (s.id != id || s.turnId != turn || s.endedAt || !s.startedAt)
           continue;
-        s.waiting = true;
-        s.interactionId = request;
-        s.waitingSince = since;
-        s.questionPreview = CompactPreview(sql.text(stmt, 6));
-        s.uncertain = false;
-      } else {
-        s.resumedAt = std::max(s.resumedAt, sql.integer(stmt, 5));
-        if (s.resumedAt > 0) {
-          s.running = true;
+        if (std::count_if(snapshot.sessions.begin(), snapshot.sessions.end(),
+                          [&](const auto &x) { return x.id == id; }) != 1)
+          continue;
+        if (status == L"running" && !sql.integer(stmt, 5)) {
+          auto since = sql.integer(stmt, 4);
+          if (since < s.startedAt || s.waiting)
+            continue;
+          s.waiting = true;
+          s.interactionId = request;
+          s.waitingSince = since;
+          s.questionPreview = CompactPreview(sql.text(stmt, 6));
           s.uncertain = false;
+        } else {
+          s.resumedAt = std::max(s.resumedAt, sql.integer(stmt, 5));
+          if (s.resumedAt > 0) {
+            s.running = true;
+            s.uncertain = false;
+          }
         }
       }
     }
+    sql.finalize(stmt);
   }
-  sql.finalize(stmt);
 }
 void ReadProjectMetadata(Sqlite &sql, Snapshot &snapshot) {
   for (auto &session : snapshot.sessions) {
@@ -158,9 +184,11 @@ void ReadProjectMetadata(Sqlite &sql, Snapshot &snapshot) {
   }
   void *schema = nullptr;
   if (sql.prepare(sql.db,
-      "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name='project_id') "
-      "AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects')",
-      -1, &schema, nullptr) != 0)
+                  "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') "
+                  "WHERE name='project_id') "
+                  "AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' "
+                  "AND name='projects')",
+                  -1, &schema, nullptr) != 0)
     return;
   const int schemaResult = sql.step(schema);
   const bool legacy = schemaResult == 100 && sql.integer(schema, 0) == 0;
@@ -172,15 +200,20 @@ void ReadProjectMetadata(Sqlite &sql, Snapshot &snapshot) {
   }
   if (schemaResult != 100)
     return;
-  const char *query = R"SQL(SELECT t.workspace_key,t.task_id,coalesce(t.project_id,''),
+  const char *query =
+      R"SQL(SELECT t.workspace_key,t.task_id,coalesce(t.project_id,''),
  CASE WHEN p.deleted=0 THEN p.name ELSE '' END,
  (SELECT count(*) FROM projects q WHERE q.deleted=0 AND q.name=p.name COLLATE NOCASE)
  FROM tasks t LEFT JOIN projects p ON p.project_id=t.project_id
  WHERE t.deleted=0 AND t.archived=0 ORDER BY t.updated_at DESC LIMIT 40)SQL";
   void *stmt = nullptr;
   if (sql.prepare(sql.db, query, -1, &stmt, nullptr) != 0)
-    return; // Metadata failures must not fall back to a guessed directory label.
-  struct Record { std::wstring workspace, id, project, name; bool ambiguous; };
+    return; // Metadata failures must not fall back to a guessed directory
+            // label.
+  struct Record {
+    std::wstring workspace, id, project, name;
+    bool ambiguous;
+  };
   std::vector<Record> records;
   int rc;
   while ((rc = sql.step(stmt)) == 100)
@@ -199,7 +232,8 @@ void ReadProjectMetadata(Sqlite &sql, Snapshot &snapshot) {
       }
   }
 }
-void ReadRunningFallback(Sqlite &sql, Snapshot &snapshot, int64_t processStart) {
+void ReadRunningFallback(Sqlite &sql, Snapshot &snapshot,
+                         int64_t processStart) {
   if (!snapshot.online || !processStart || !sql.bind)
     return;
   const char *query = R"SQL(SELECT m.id,json_extract(m.data,'$.anchor.turnId'),
@@ -215,23 +249,30 @@ void ReadRunningFallback(Sqlite &sql, Snapshot &snapshot, int64_t processStart) 
  ORDER BY m.sequence DESC,m.time_created DESC LIMIT 1)SQL";
   for (auto &session : snapshot.sessions) {
     if (session.running || session.waiting ||
-        std::count_if(snapshot.sessions.begin(), snapshot.sessions.end(),
-                      [&](const auto &other) { return other.id == session.id; }) != 1)
+        std::count_if(
+            snapshot.sessions.begin(), snapshot.sessions.end(),
+            [&](const auto &other) { return other.id == session.id; }) != 1)
       continue;
     void *stmt = nullptr;
     if (sql.prepare(sql.db, query, -1, &stmt, nullptr) != 0)
-      return; // Optional/schema-incompatible database never overrides log evidence.
+      return; // Optional/schema-incompatible database never overrides log
+              // evidence.
     const auto id = Utf8(session.id);
-    if (sql.bind(stmt, 1, id.c_str(), -1, nullptr) == 0 && sql.step(stmt) == 100) {
+    if (sql.bind(stmt, 1, id.c_str(), -1, nullptr) == 0 &&
+        sql.step(stmt) == 100) {
       const auto turn = sql.text(stmt, 1), finish = sql.text(stmt, 3);
-      const auto created = sql.integer(stmt, 2), completed = sql.integer(stmt, 4),
+      const auto created = sql.integer(stmt, 2),
+                 completed = sql.integer(stmt, 4),
                  partUpdated = sql.integer(stmt, 5);
       const auto evidence = std::max(created, partUpdated);
-      const bool fresh = evidence >= processStart &&
-                         evidence > std::max(session.startedAt, session.endedAt);
-      const bool closedTurn = session.endedAt && !turn.empty() && turn == session.turnId;
+      const bool fresh =
+          evidence >= processStart &&
+          evidence > std::max(session.startedAt, session.endedAt);
+      const bool closedTurn =
+          session.endedAt && !turn.empty() && turn == session.turnId;
       if (fresh && !closedTurn && !completed &&
-          (finish.empty() || (finish == L"tool-calls" && partUpdated >= processStart))) {
+          (finish.empty() ||
+           (finish == L"tool-calls" && partUpdated >= processStart))) {
         session.running = true;
         session.uncertain = true;
         session.turnId = turn;
@@ -242,17 +283,59 @@ void ReadRunningFallback(Sqlite &sql, Snapshot &snapshot, int64_t processStart) 
     sql.finalize(stmt);
   }
 }
-void ReadCurrentQuestions(const fs::path &root, Snapshot &snapshot, int64_t processStart) {
+void ReadCurrentQuestions(const fs::path &root, Snapshot &snapshot,
+                          int64_t processStart) {
   Sqlite sql;
   if (!sql.valid())
     return;
   auto path = Utf8((root / L"cli/db/db.sqlite").wstring());
   if (sql.open(path.c_str(), &sql.db, 1, nullptr) != 0)
     return;
+  auto before = Microseconds();
   ReadRunningFallback(sql, snapshot, processStart);
+  timing.fallbackUs = Microseconds() - before;
+  before = Microseconds();
   ReadQuestionsFromDb(sql, snapshot);
+  timing.questionsUs = Microseconds() - before;
 }
 int64_t ProcessStart() {
+  std::set<DWORD> windowProcesses;
+  EnumWindows(
+      [](HWND window, LPARAM data) -> BOOL {
+        wchar_t title[16]{};
+        GetWindowTextW(window, title, 16);
+        if (wcscmp(title, L"ZCode") == 0) {
+          DWORD pid = 0;
+          GetWindowThreadProcessId(window, &pid);
+          if (pid)
+            reinterpret_cast<std::set<DWORD> *>(data)->insert(pid);
+        }
+        return TRUE;
+      },
+      reinterpret_cast<LPARAM>(&windowProcesses));
+  int64_t visibleStart = 0;
+  for (const auto pid : windowProcesses) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process)
+      continue;
+    wchar_t image[32768]{};
+    DWORD length = 32768;
+    FILETIME created{}, ended{}, kernel{}, user{};
+    if (QueryFullProcessImageNameW(process, 0, image, &length) &&
+        _wcsicmp(fs::path(image).filename().c_str(), L"ZCode.exe") == 0 &&
+        GetProcessTimes(process, &created, &ended, &kernel, &user)) {
+      ULARGE_INTEGER value{};
+      value.LowPart = created.dwLowDateTime;
+      value.HighPart = created.dwHighDateTime;
+      visibleStart = std::max(
+          visibleStart, (int64_t)(value.QuadPart / 10000 - 11644473600000ULL));
+    }
+    CloseHandle(process);
+  }
+  if (visibleStart)
+    return visibleStart;
+  // Keep background/startup detection when no regular ZCode window exists.
+
   HANDLE h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
   if (h == INVALID_HANDLE_VALUE)
     return 0;
@@ -311,32 +394,100 @@ void Apply(std::map<std::wstring, Activity> &events, const json &j,
     a = {false, turn, j.value("outcome", std::string{}), at, began};
   }
 }
-std::map<std::wstring, Activity> ReadEvents(const fs::path &path,
-                                            int64_t start) {
-  std::map<std::wstring, Activity> out;
-  // Shared read is essential: the official app retains its log handle while
-  // running.
+struct EventLogCursor {
+  fs::path path;
+  int64_t processStart = 0, seenSize = -1, cursor = 0;
+  DWORD volume = 0, indexHigh = 0, indexLow = 0;
+  FILETIME modified{};
+  uint64_t bytesRead = 0;
+  bool skipFragment = false;
+  std::string tail;
+  std::map<std::wstring, Activity> events;
+};
+const std::map<std::wstring, Activity> &
+ReadEvents(const fs::path &path, int64_t start, EventLogCursor &cache) {
   HANDLE h = CreateFileW(path.c_str(), GENERIC_READ,
                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                          nullptr, OPEN_EXISTING, 0, nullptr);
-  if (h == INVALID_HANDLE_VALUE)
-    return out;
-  LARGE_INTEGER size;
-  if (!GetFileSizeEx(h, &size)) {
+  if (h == INVALID_HANDLE_VALUE) {
+    cache.events.clear();
+    cache.seenSize = -1;
+    return cache.events;
+  }
+  BY_HANDLE_FILE_INFORMATION info{};
+  LARGE_INTEGER size{};
+  if (!GetFileSizeEx(h, &size) || !GetFileInformationByHandle(h, &info)) {
     CloseHandle(h);
-    return out;
+    cache.events.clear();
+    cache.seenSize = -1;
+    return cache.events;
   }
   constexpr DWORD cap = 4 * 1024 * 1024;
-  DWORD bytes = (DWORD)std::min<int64_t>(size.QuadPart, cap);
-  LARGE_INTEGER pos;
-  pos.QuadPart = size.QuadPart - bytes;
+  bool reset =
+      cache.path != path || cache.processStart != start || cache.seenSize < 0 ||
+      cache.volume != info.dwVolumeSerialNumber ||
+      cache.indexHigh != info.nFileIndexHigh ||
+      cache.indexLow != info.nFileIndexLow || size.QuadPart < cache.seenSize ||
+      (size.QuadPart == cache.seenSize &&
+       CompareFileTime(&cache.modified, &info.ftLastWriteTime) != 0);
+  if (!reset && size.QuadPart == cache.seenSize) {
+    CloseHandle(h);
+    return cache.events;
+  }
+  if (!reset && !cache.tail.empty()) {
+    LARGE_INTEGER point{};
+    point.QuadPart = cache.cursor - (int64_t)cache.tail.size();
+    std::string check(cache.tail.size(), 0);
+    DWORD got = 0;
+    SetFilePointerEx(h, point, nullptr, FILE_BEGIN);
+    if (!ReadFile(h, check.data(), (DWORD)check.size(), &got, nullptr) ||
+        got != check.size() || check != cache.tail)
+      reset = true;
+    cache.bytesRead += got;
+  }
+  if (size.QuadPart - cache.cursor > cap)
+    reset = true;
+  if (reset) {
+    cache.events.clear();
+    cache.tail.clear();
+    cache.cursor = std::max<int64_t>(0, size.QuadPart - cap);
+    cache.skipFragment = cache.cursor > 0;
+  }
+  cache.path = path;
+  cache.processStart = start;
+  cache.volume = info.dwVolumeSerialNumber;
+  cache.indexHigh = info.nFileIndexHigh;
+  cache.indexLow = info.nFileIndexLow;
+  cache.modified = info.ftLastWriteTime;
+  LARGE_INTEGER pos{};
+  pos.QuadPart = cache.cursor;
   SetFilePointerEx(h, pos, nullptr, FILE_BEGIN);
+  const DWORD bytes =
+      (DWORD)std::min<int64_t>(size.QuadPart - pos.QuadPart, cap);
   std::string s(bytes, 0);
   DWORD got = 0;
-  ReadFile(h, s.data(), bytes, &got, nullptr);
+  if (!ReadFile(h, s.data(), bytes, &got, nullptr)) {
+    CloseHandle(h);
+    cache.seenSize = -1;
+    cache.events.clear();
+    return cache.events;
+  }
   CloseHandle(h);
   s.resize(got);
-  size_t off = pos.QuadPart ? s.find('\n') + 1 : 0;
+  cache.bytesRead += got;
+  cache.seenSize = pos.QuadPart + got;
+  size_t off = 0;
+  if (cache.skipFragment) {
+    const auto newline = s.find('\n');
+    if (newline == std::string::npos) {
+      cache.cursor = cache.seenSize;
+      cache.tail = s.substr(s.size() - std::min<size_t>(64, s.size()));
+      return cache.events;
+    }
+    off = newline + 1;
+    cache.skipFragment = false;
+  }
+  auto &out = cache.events;
   while (off < s.size()) {
     auto end = s.find('\n', off);
     if (end == std::string::npos)
@@ -371,12 +522,96 @@ std::map<std::wstring, Activity> ReadEvents(const fs::path &path,
     } catch (const json::exception &) {
     }
   }
-  return out;
+  cache.cursor = pos.QuadPart + (int64_t)off;
+  if (off)
+    cache.tail =
+        s.substr(off - std::min<size_t>(64, off), std::min<size_t>(64, off));
+  return cache.events;
+}
+bool EventCursorTests() {
+  wchar_t directory[MAX_PATH]{}, filename[MAX_PATH]{};
+  if (!GetTempPathW(MAX_PATH, directory) ||
+      !GetTempFileNameW(directory, L"zcp", 0, filename))
+    return false;
+  struct TempLog {
+    fs::path path;
+    ~TempLog() { DeleteFileW(path.c_str()); }
+  } file{filename};
+  auto write = [&](const std::string &text, bool append = false) {
+    std::ofstream output(file.path,
+                         std::ios::binary |
+                             (append ? std::ios::app : std::ios::trunc));
+    output.write(text.data(), text.size());
+    return output.good();
+  };
+  auto line = [](const char *kind, const char *turn) {
+    return std::string("[2026-10-29 12:00:00.000] [cua-pip-session] "
+                       "{\"eventId\":\"fixture\",\"sessionId\":\"log-test\","
+                       "\"kind\":\"") +
+           kind + "\",\"turnId\":\"" + turn + "\",\"outcome\":\"completed\"}\n";
+  };
+  EventLogCursor cursor;
+  if (!write(line("turn-started", "one")))
+    return false;
+  ReadEvents(file.path, 0, cursor);
+  if (!cursor.events[L"log-test"].running)
+    return false;
+  const auto initialBytes = cursor.bytesRead;
+  ReadEvents(file.path, 0, cursor);
+  if (cursor.bytesRead != initialBytes)
+    return false;
+  auto ended = line("turn-ended", "one");
+  ended.pop_back();
+  if (!write(ended, true))
+    return false;
+  ReadEvents(file.path, 0, cursor);
+  if (!cursor.events[L"log-test"].running)
+    return false;
+  if (!write("\n", true))
+    return false;
+  ReadEvents(file.path, 0, cursor);
+  if (cursor.events[L"log-test"].running)
+    return false;
+  if (!write(line("turn-started", "two"), true))
+    return false;
+  ReadEvents(file.path, 0, cursor);
+  if (cursor.events[L"log-test"].turn != "two")
+    return false;
+  if (!write(line("turn-started", "three")))
+    return false;
+  ReadEvents(file.path, 0, cursor);
+  if (cursor.events[L"log-test"].turn != "three")
+    return false;
+  wchar_t replacement[MAX_PATH]{};
+  if (!GetTempFileNameW(directory, L"zcp", 0, replacement))
+    return false;
+  TempLog newer{replacement};
+  {
+    std::ofstream output(newer.path, std::ios::binary);
+    output << line("turn-started", "four");
+  }
+  if (!MoveFileExW(newer.path.c_str(), file.path.c_str(),
+                   MOVEFILE_REPLACE_EXISTING))
+    return false;
+  ReadEvents(file.path, 0, cursor);
+  if (cursor.events[L"log-test"].turn != "four")
+    return false;
+  if (!write(std::string(4 * 1024 * 1024 + 100, 'x') + "\n" +
+             line("turn-started", "five")))
+    return false;
+  ReadEvents(file.path, 0, cursor);
+  if (cursor.events[L"log-test"].turn != "five")
+    return false;
+  ReadEvents(file.path, INT64_MAX, cursor);
+  return cursor.events.empty();
 }
 } // namespace
 Snapshot Observe() {
+  timing = {};
+  const auto began = Microseconds();
   Snapshot out;
   int64_t start = ProcessStart();
+  timing.processUs = Microseconds() - began;
   out.online = start != 0;
   wchar_t home[32768];
   if (!GetEnvironmentVariableW(L"USERPROFILE", home, 32768)) {
@@ -421,13 +656,19 @@ Snapshot Observe() {
     out.error = L"会话索引暂时忙碌，稍后重试";
     return out;
   }
+  timing.indexUs = Microseconds() - began - timing.processUs;
+  auto checkpoint = Microseconds();
   ReadProjectMetadata(sql, out);
+  timing.metadataUs = Microseconds() - checkpoint;
   if (start) {
     SYSTEMTIME t;
     GetLocalTime(&t);
     wchar_t name[64];
     swprintf_s(name, L"%04d-%02d-%02d.log", t.wYear, t.wMonth, t.wDay);
-    auto events = ReadEvents(root / L"v2/logs" / name, start);
+    checkpoint = Microseconds();
+    static thread_local EventLogCursor cursor;
+    const auto &events = ReadEvents(root / L"v2/logs" / name, start, cursor);
+    timing.logUs = Microseconds() - checkpoint;
     for (auto &s : out.sessions) {
       if (std::count_if(out.sessions.begin(), out.sessions.end(),
                         [&](const Session &x) { return x.id == s.id; }) != 1)
@@ -453,8 +694,10 @@ Snapshot Observe() {
                      return a.waiting != b.waiting ? a.waiting > b.waiting
                                                    : a.running > b.running;
                    });
+  timing.totalUs = Microseconds() - began;
   return out;
 }
+ObserverTiming LastObserverTiming() { return timing; }
 std::wstring ReadFinalRecap(const Session &session) {
   wchar_t home[32768];
   if (!GetEnvironmentVariableW(L"USERPROFILE", home, 32768))
@@ -468,6 +711,8 @@ std::wstring ReadFinalRecap(const Session &session) {
   return RecapFromDb(sql, session);
 }
 bool ObserverTests() {
+  if (!EventCursorTests())
+    return false;
   Sqlite fixture;
   if (!fixture.valid() ||
       fixture.open(":memory:", &fixture.db, 6, nullptr) != 0)
@@ -535,7 +780,8 @@ bool ObserverTests() {
   ReadQuestionsFromDb(fixture, waiting);
   if (waiting.sessions[0].waiting || waiting.sessions[0].resumedAt != 400)
     return false;
-  if (!exec(R"SQL(INSERT INTO message VALUES('fallback','fallback',1000,1,'{"role":"assistant","anchor":{"turnId":"new"}}'))SQL"))
+  if (!exec(
+          R"SQL(INSERT INTO message VALUES('fallback','fallback',1000,1,'{"role":"assistant","anchor":{"turnId":"new"}}'))SQL"))
     return false;
   Snapshot fallback;
   fallback.online = true;
@@ -549,26 +795,31 @@ bool ObserverTests() {
   ReadRunningFallback(fixture, fallback, 1100);
   if (fallback.sessions[0].running)
     return false;
-  if (!exec(R"SQL(UPDATE message SET data=json_set(data,'$.time.completed',1200) WHERE id='fallback')SQL"))
+  if (!exec(
+          R"SQL(UPDATE message SET data=json_set(data,'$.time.completed',1200) WHERE id='fallback')SQL"))
     return false;
   fallback.sessions = {row};
   ReadRunningFallback(fixture, fallback, 900);
   if (fallback.sessions[0].running)
     return false;
-  if (!exec(R"SQL(UPDATE message SET data=json_remove(json_set(data,'$.finish','tool-calls'),'$.time.completed') WHERE id='fallback')SQL") ||
-      !exec(R"SQL(INSERT INTO part(message_id,session_id,time_created,sequence,data,time_updated) VALUES('fallback','fallback',1000,1,'{"state":{"status":"running"}}',1100))SQL"))
+  if (!exec(
+          R"SQL(UPDATE message SET data=json_remove(json_set(data,'$.finish','tool-calls'),'$.time.completed') WHERE id='fallback')SQL") ||
+      !exec(
+          R"SQL(INSERT INTO part(message_id,session_id,time_created,sequence,data,time_updated) VALUES('fallback','fallback',1000,1,'{"state":{"status":"running"}}',1100))SQL"))
     return false;
   fallback.sessions = {row};
   ReadRunningFallback(fixture, fallback, 900);
   if (!fallback.sessions[0].running)
     return false;
-  if (!exec(R"SQL(UPDATE part SET data=json_set(data,'$.state.time.end',1200) WHERE message_id='fallback')SQL"))
+  if (!exec(
+          R"SQL(UPDATE part SET data=json_set(data,'$.state.time.end',1200) WHERE message_id='fallback')SQL"))
     return false;
   fallback.sessions = {row};
   ReadRunningFallback(fixture, fallback, 900);
   if (fallback.sessions[0].running)
     return false;
-  if (!exec(R"SQL(UPDATE part SET data=json_remove(data,'$.state.time.end') WHERE message_id='fallback')SQL"))
+  if (!exec(
+          R"SQL(UPDATE part SET data=json_remove(data,'$.state.time.end') WHERE message_id='fallback')SQL"))
     return false;
   row.turnId = L"new";
   row.endedAt = 1050;
@@ -578,7 +829,8 @@ bool ObserverTests() {
     return false; // An explicit log end wins over a lingering running part.
   row.turnId.clear();
   row.endedAt = 0;
-  if (!exec(R"SQL(INSERT INTO message VALUES('newest','fallback',1200,2,'{"role":"assistant","finish":"stop"}'))SQL"))
+  if (!exec(
+          R"SQL(INSERT INTO message VALUES('newest','fallback',1200,2,'{"role":"assistant","finish":"stop"}'))SQL"))
     return false;
   fallback.sessions = {row};
   ReadRunningFallback(fixture, fallback, 900);
@@ -586,36 +838,74 @@ bool ObserverTests() {
     return false; // Never inspect running parts belonging to older messages.
   ReadProjectMetadata(fixture, fallback);
   if (fallback.sessions[0].projectMetadataKnown)
-    return false; // Confirmed old schema keeps the old directory-label behavior.
-  if (!exec("CREATE TABLE projects(project_id TEXT,name TEXT,deleted INTEGER)") ||
-      !exec("CREATE TABLE tasks(workspace_key TEXT,task_id TEXT,project_id TEXT,deleted INTEGER,archived INTEGER,updated_at INTEGER)") ||
-      !exec("INSERT INTO projects VALUES('p1','bilibili-report',0),('p2','other-report',0)") ||
-      !exec("INSERT INTO tasks VALUES('w','a','p1',0,0,2),('w','b','p2',0,0,1)"))
+    return false; // Confirmed old schema keeps the old directory-label
+                  // behavior.
+  if (!exec(
+          "CREATE TABLE projects(project_id TEXT,name TEXT,deleted INTEGER)") ||
+      !exec("CREATE TABLE tasks(workspace_key TEXT,task_id TEXT,project_id "
+            "TEXT,deleted INTEGER,archived INTEGER,updated_at INTEGER)") ||
+      !exec("INSERT INTO projects "
+            "VALUES('p1','bilibili-report',0),('p2','other-report',0)") ||
+      !exec(
+          "INSERT INTO tasks VALUES('w','a','p1',0,0,2),('w','b','p2',0,0,1)"))
     return false;
   Snapshot projects;
   Session projectRow;
-  projectRow.id=L"a"; projectRow.workspace=L"w"; projectRow.path=L"C:/bilibili-project";
-  auto otherProject=projectRow; otherProject.id=L"b";
-  projects.sessions={projectRow,otherProject};
+  projectRow.id = L"a";
+  projectRow.workspace = L"w";
+  projectRow.path = L"C:/bilibili-project";
+  auto otherProject = projectRow;
+  otherProject.id = L"b";
+  projects.sessions = {projectRow, otherProject};
   ReadProjectMetadata(fixture, projects);
   if (!projects.sessions[0].projectMetadataKnown ||
-      projects.sessions[0].projectDisplayName!=L"bilibili-report" ||
-      projects.sessions[1].projectDisplayName!=L"other-report")
+      projects.sessions[0].projectDisplayName != L"bilibili-report" ||
+      projects.sessions[1].projectDisplayName != L"other-report")
     return false;
   if (!exec("UPDATE projects SET name='renamed' WHERE project_id='p1'"))
     return false;
   ReadProjectMetadata(fixture, projects);
-  if (projects.sessions[0].projectDisplayName!=L"renamed")
+  if (projects.sessions[0].projectDisplayName != L"renamed")
     return false;
   if (!exec("UPDATE projects SET name='RENAMED' WHERE project_id='p2'"))
     return false;
   ReadProjectMetadata(fixture, projects);
-  if (!projects.sessions[0].projectNameAmbiguous || !projects.sessions[1].projectNameAmbiguous)
+  if (!projects.sessions[0].projectNameAmbiguous ||
+      !projects.sessions[1].projectNameAmbiguous)
     return false;
   if (!exec("UPDATE projects SET deleted=1 WHERE project_id='p1'"))
     return false;
   ReadProjectMetadata(fixture, projects);
   if (!projects.sessions[0].projectDisplayName.empty())
+    return false;
+  // A large history in the SAME session must not be scanned for a new turn.
+  if (!exec("CREATE UNIQUE INDEX message_id_fixture ON message(id)") ||
+      !exec("CREATE INDEX message_session_sequence_idx ON "
+            "message(session_id,sequence,time_created,id)") ||
+      !exec("CREATE INDEX part_session_message_sequence_idx ON "
+            "part(session_id,message_id,sequence)") ||
+      !exec(
+          R"SQL(INSERT INTO message VALUES('history','a',0,0,'{"role":"assistant","anchor":{"turnId":"old-history"}}'))SQL") ||
+      !exec(
+          R"SQL(WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<20000)
+ INSERT INTO part(message_id,session_id,time_created,sequence,data,time_updated)
+ SELECT 'history','a',0,n,'{"type":"text","text":"fixture history"}',0 FROM numbers)SQL"))
+    return false;
+  void *boundedQuery = nullptr;
+  if (fixture.prepare(fixture.db, QuestionQuery(), -1, &boundedQuery,
+                      nullptr) != 0)
+    return false;
+  fixture.bind(boundedQuery, 1, "a", -1, nullptr);
+  fixture.bind(boundedQuery, 2, "t1", -1, nullptr);
+  int boundedResult;
+  while ((boundedResult = fixture.step(boundedQuery)) == 100) {
+  }
+  auto statementStatus = reinterpret_cast<int(__cdecl *)(void *, int, int)>(
+      GetProcAddress(fixture.mod, "sqlite3_stmt_status"));
+  const int fullScan =
+      statementStatus ? statementStatus(boundedQuery, 1, 0) : INT_MAX;
+  fixture.finalize(boundedQuery);
+  if (boundedResult != 101 || fullScan > 128)
     return false;
   std::map<std::wstring, Activity> e;
   Apply(e, {{"sessionId", "a"}, {"kind", "turn-started"}, {"turnId", "t1"}},

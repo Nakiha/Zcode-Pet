@@ -2046,6 +2046,31 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   wchar_t path[32768];
   GetModuleFileNameW(nullptr, path, 32768);
   base = fs::path(path).parent_path();
+  if(wcsstr(command,L"--observer-benchmark")) {
+    std::ofstream results(base/L"observer-benchmark.csv");
+    if(!results)return 2;
+    results << "sample,cpuUs,processUs,indexUs,metadataUs,logUs,fallbackUs,questionsUs,totalUs,error,online\n";
+    auto cpu=[] {
+      FILETIME created,ended,kernel,user;
+      GetThreadTimes(GetCurrentThread(),&created,&ended,&kernel,&user);
+      ULARGE_INTEGER k{},u{};
+      k.LowPart=kernel.dwLowDateTime;k.HighPart=kernel.dwHighDateTime;
+      u.LowPart=user.dwLowDateTime;u.HighPart=user.dwHighDateTime;
+      return (k.QuadPart+u.QuadPart)/10;
+    };
+    for(int sample=0;sample<24;++sample) {
+      const auto before=cpu();
+      const auto observed=Observe();
+      const auto used=cpu()-before;
+      const auto t=LastObserverTiming();
+      results << sample << ',' << used << ',' << t.processUs << ',' << t.indexUs
+        << ',' << t.metadataUs << ',' << t.logUs << ',' << t.fallbackUs << ','
+        << t.questionsUs << ',' << t.totalUs << ',' << !observed.error.empty()
+        << ',' << observed.online << '\n';
+      Sleep(50);
+    }
+    return 0;
+  }
   if(wcsstr(command,L"--spine-lifecycle-test"))return SpineLifecycleTests(base/L"assets/spine") ? 0 : 1;
   if(wcsstr(command,L"--spine-model-test"))return SpineModelTests(base/L"assets/spine") ? 0 : 1;
   if (wcsstr(command,L"--spine-render-test"))

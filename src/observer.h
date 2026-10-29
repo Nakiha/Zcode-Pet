@@ -23,4 +23,9 @@ struct Snapshot {
 };
 Snapshot Observe();
 bool ObserverTests();
+struct ObserverTiming {
+  uint64_t processUs = 0, indexUs = 0, metadataUs = 0, logUs = 0,
+           fallbackUs = 0, questionsUs = 0, totalUs = 0;
+};
+ObserverTiming LastObserverTiming();
 std::wstring ReadFinalRecap(const Session &session);
