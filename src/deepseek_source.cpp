@@ -1,4 +1,5 @@
 #include "data_sources.h"
+#include "harness_cache.h"
 #include "../third_party/json.hpp"
 #include "../third_party/zstd/zstd.h"
 #include "../third_party/zstd/zstd_errors.h"
@@ -24,7 +25,8 @@ std::wstring Wide(const std::string &s) {
 }
 struct Fold {
   Session s;
-  bool header = false, hidden = false, boundary = false;
+  bool header = false, hidden = false, boundary = false, seeded = false;
+  int64_t createdAt = 0, titleSeq = -1;
   std::set<std::wstring> approvals;
   void Apply(const json &v) {
     const auto type = v.value("type", std::string{});
@@ -37,6 +39,8 @@ struct Fold {
       s.workspace = L"deepseek:" + s.path;
       s.title = L"新会话";
       s.updated = v.value("createdAt", int64_t{});
+      createdAt = s.updated;
+      seeded = v.value("isSeeded", false);
       hidden = v.value("origin", std::string{}) == "subagent";
       header = true;
       return;
@@ -46,8 +50,10 @@ struct Fold {
     const auto &d = v.at("data");
     auto at = v.value("time", int64_t{});
     s.updated = std::max(s.updated, at);
-    if (type == "session/title")
+    if (type == "session/title") {
       s.title = Wide(d.at("title").get<std::string>());
+      titleSeq = v.value("seq", int64_t(-1));
+    }
     if (type == "turn/start") {
       boundary = true;
       s.turnId = std::to_wstring(d.at("turn").get<int64_t>());
@@ -94,7 +100,7 @@ struct Cursor {
   uint64_t offset = 0, observedSize = 0;
   FILETIME written{}, creation{};
   DWORD volume = 0, indexHigh = 0, indexLow = 0;
-  bool failed = false, bufferedReady = false;
+  bool failed = false, bufferedReady = false, unavailable=false;
   std::vector<char> pending;
   uint64_t target = 0;
   std::optional<Fold> published;
@@ -102,64 +108,33 @@ struct Cursor {
 struct Reader {
   fs::path root;
   std::map<fs::path, Cursor> cursors;
-  fs::recursive_directory_iterator scan, end;
-  ULONGLONG nextScan = 0;
-  std::shared_ptr<void> discoveryWatch;
+  std::unique_ptr<HarnessCacheIndex> cache;
+  std::map<fs::path, HarnessCacheFact> cacheFacts;
   uint64_t bytes = 0, parses = 0;
   size_t nextRead = 0;
-  bool deferred=false;
+  bool deferred = false;
   void Discover() {
-    if (!discoveryWatch) {
-      const auto handle = FindFirstChangeNotificationW(
-          root.c_str(), TRUE,
-          FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_FILE_NAME);
-      if (handle != INVALID_HANDLE_VALUE)
-        discoveryWatch = {
-            handle, [](void *value) { FindCloseChangeNotification(value); }};
-    }
-    if (discoveryWatch &&
-        WaitForSingleObject(discoveryWatch.get(), 0) == WAIT_OBJECT_0) {
-      nextScan = 0;
-      if (!FindNextChangeNotification(discoveryWatch.get()))
-        discoveryWatch.reset();
-    }
-    std::error_code ec;
-    if (scan == end && GetTickCount64() >= nextScan) {
-      scan = fs::recursive_directory_iterator(
-          root, fs::directory_options::skip_permission_denied, ec);
-      nextScan = GetTickCount64() + 30000;
-    }
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::milliseconds(4);
-    unsigned visited = 0;
-    while (scan != end && visited++ < 256 &&
-           std::chrono::steady_clock::now() < deadline) {
-      auto entry = *scan;
-      auto depth = scan.depth();
-      if (entry.is_directory(ec) && depth >= 2)
-        scan.disable_recursion_pending();
-      const auto name = entry.path().filename().wstring();
-      if (depth == 2 &&
-          (name == L"session.v4.jsonl" || name == L"session.v4.jsonl.zstd"))
-        cursors.try_emplace(entry.path());
-      scan.increment(ec);
-      if (ec) {
-        scan = end;
-        break;
+    if (!cache)
+      cache = std::make_unique<HarnessCacheIndex>(
+          root.parent_path() / L"storages/session_projcache/sessions");
+    cache->Poll();
+    cacheFacts.clear();
+    for (const auto &[file, fact] : cache->facts) {
+      auto log = HarnessLogPath(root, fact);
+      if (GetFileAttributesW(log.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        auto plain = log;
+        plain.replace_extension();
+        if (GetFileAttributesW(plain.c_str()) != INVALID_FILE_ATTRIBUTES)
+          log = plain;
       }
+      cacheFacts[log] = fact;
+      cursors.try_emplace(log);
     }
-    // Bound retained state; recent files win. Discovery work is sliced across
-    // polls.
-    if (cursors.size() > 80) {
-      std::vector<std::pair<fs::file_time_type, fs::path>> rank;
-      for (auto &[p, c] : cursors) {
-        auto t = fs::last_write_time(p, ec);
-        rank.push_back({t, p});
-      }
-      std::sort(rank.begin(), rank.end(), std::greater<>());
-      for (size_t i = 80; i < rank.size(); ++i)
-        cursors.erase(rank[i].second);
-    }
+    for (auto it = cursors.begin(); it != cursors.end();)
+      if (!cacheFacts.contains(it->first))
+        it = cursors.erase(it);
+      else
+        ++it;
   }
   bool Read(const fs::path &p, Cursor &c, size_t &budget) {
     WIN32_FILE_ATTRIBUTE_DATA metadata{};
@@ -220,10 +195,11 @@ struct Reader {
                 if (event != json::parse_event_t::key)
                   return true;
                 const auto key = value.get<std::string>();
-                return key == "type" || key == "data" || key == "version" ||
-                       key == "id" || key == "createdAt" || key == "cwd" ||
-                       key == "origin" || key == "time" || key == "turn" ||
-                       key == "reason" || key == "kind" || key == "title";
+                return key == "seq" || key == "isSeeded" || key == "type" ||
+                       key == "data" || key == "version" || key == "id" ||
+                       key == "createdAt" || key == "cwd" || key == "origin" ||
+                       key == "time" || key == "turn" || key == "reason" ||
+                       key == "kind" || key == "title";
               });
           fold.Apply(value);
           ++parses;
@@ -264,7 +240,8 @@ struct Reader {
       // replaying old tool outputs. Accept only a validated contiguous frame
       // chain.
       if ((!c.published || c.offset + 2 * 1024 * 1024 < size) &&
-          size > 2 * 1024 * 1024 && budget >= 2 * 1024 * 1024 + 64 * 1024 && compressed) {
+          size > 2 * 1024 * 1024 && budget >= 2 * 1024 * 1024 + 64 * 1024 &&
+          compressed) {
         auto head = readAt(0, 64 * 1024);
         auto first = ZSTD_findFrameCompressedSize(head.data(), head.size());
         if (!ZSTD_isError(first)) {
@@ -330,7 +307,8 @@ struct Reader {
         }
       }
       if ((!c.published || c.offset + 2 * 1024 * 1024 < size) &&
-          size > 2 * 1024 * 1024 && budget >= 2 * 1024 * 1024 + 64 * 1024 && !compressed) {
+          size > 2 * 1024 * 1024 && budget >= 2 * 1024 * 1024 + 64 * 1024 &&
+          !compressed) {
         auto head = readAt(0, 64 * 1024);
         auto newline = std::find(head.begin(), head.end(), '\n');
         if (newline != head.end()) {
@@ -386,7 +364,8 @@ struct Reader {
       c.bufferedReady = !incomplete && used < c.pending.size();
       c.offset += used;
       c.pending.erase(c.pending.begin(), c.pending.begin() + used);
-      if(c.pending.empty() && c.pending.capacity()>256*1024)std::vector<char>().swap(c.pending);
+      if (c.pending.empty() && c.pending.capacity() > 256 * 1024)
+        std::vector<char>().swap(c.pending);
       if (c.pending.size() > 4 * 1024 * 1024)
         throw std::runtime_error("oversize compressed record");
       c.written = info.ftLastWriteTime;
@@ -420,11 +399,13 @@ struct Reader {
          serviced < paths.size() && std::chrono::steady_clock::now() < deadline;
          ++serviced) {
       const auto &p = paths[(nextRead + serviced) % paths.size()];
-      if(!budget && cursors.at(p).pending.empty())break;
-      if (!Read(p, cursors.at(p), budget))
-        cursors.erase(p);
+      if (!budget && cursors.at(p).pending.empty())
+        break;
+      if (!Read(p, cursors.at(p), budget)){
+        cursors.at(p) = Cursor{};cursors.at(p).unavailable=true;
+      }
     }
-    deferred=serviced<paths.size();
+    deferred = serviced < paths.size();
     if (!paths.empty())
       nextRead = (nextRead + serviced) % paths.size();
     for (auto it = cursors.begin(); it != cursors.end();) {
@@ -433,6 +414,10 @@ struct Reader {
         out.error = L"会话格式不支持、损坏或单条记录过大";
       if (c.fold.header && !c.fold.hidden) {
         auto s = c.published ? c.published->s : c.fold.s;
+        const auto named = cacheFacts.find(it->first);
+        if (named != cacheFacts.end())
+          ApplyHarnessCacheTitle(named->second, s, c.fold.createdAt,
+                                 c.fold.seeded, c.fold.titleSeq);
         s.catchingUp = c.offset < size_t(c.target);
         if (c.failed)
           s.uncertain = true;
@@ -446,6 +431,18 @@ struct Reader {
           s.waiting = false;
           s.result.clear();
         }
+        out.sessions.push_back(std::move(s));
+      } else if (auto fact = cacheFacts.find(it->first);
+                 fact != cacheFacts.end()) {
+        Session s;
+        s.source = SourceId::DeepSeek;
+        s.id = fact->second.id;
+        s.path = fact->second.cwd;
+        s.workspace = L"deepseek:" + s.path;
+        s.title =
+            fact->second.title.empty() ? L"标题同步中" : fact->second.title;
+        s.updated = fact->second.createdAt;
+        s.uncertain = true;
         out.sessions.push_back(std::move(s));
       }
       ++it;
@@ -508,9 +505,9 @@ Snapshot ObserveDeepSeek(const fs::path &root) {
   }
   const auto start = HarnessStart();
   auto result = reader.Poll(start != 0, start);
-  bool backlog = reader.deferred || reader.scan != reader.end;
+  bool backlog = reader.deferred || (reader.cache && reader.cache->Busy());
   for (const auto &[path, c] : reader.cursors)
-    if (!c.failed && ((!c.fold.header && c.target == 0) || c.bufferedReady ||
+    if (!c.failed && !c.unavailable && ((!c.fold.header && c.target == 0) || c.bufferedReady ||
                       c.offset + c.pending.size() < c.target))
       backlog = true;
   SetHarnessBacklog(backlog);
@@ -555,7 +552,7 @@ std::string Frame(const std::string &text) {
 }
 } // namespace
 bool DataSourceTests(bool benchmark) {
-  if (!FoldTests())
+  if (!HarnessCacheTests() || !FoldTests())
     return false;
   wchar_t dir[MAX_PATH]{}, name[MAX_PATH]{};
   GetTempPathW(MAX_PATH, dir);

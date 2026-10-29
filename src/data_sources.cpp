@@ -59,7 +59,7 @@ Snapshot Observe() {
     if (GetFileAttributesW((home / L".zcode/v2/tasks-index.sqlite").c_str()) !=
         INVALID_FILE_ATTRIBUTES)
       found |= 1;
-    if (GetFileAttributesW((harness / L"sessions").c_str()) !=
+    if (GetFileAttributesW((harness / L"storages/session_projcache/sessions").c_str()) !=
         INVALID_FILE_ATTRIBUTES)
       found |= 2;
     detected = found;
