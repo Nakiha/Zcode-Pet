@@ -44,7 +44,8 @@ std::vector<Item> Items() {
             {12, L"面板缩小"},
             {0, L"面板当前缩放"},
             {13, L"面板放大"},
-            {17, L"恢复面板默认大小"}};
+            {17, L"恢复面板默认大小"},
+            {104, L"显示会话数量"}};
   if (page == 3)
     return {{1000, L"返回"},
             {20, L"DirectWrite 灰度文字"},
@@ -55,8 +56,12 @@ std::vector<Item> Items() {
   if (page == 4)
     return {{1000, L"返回"}, {30, L"实时亚克力 · 模糊后方窗口"},
             {31, L"壁纸云母 · 仅使用桌面壁纸"}, {32, L"纯色 · 关闭背景材质"}};
+  if (page == 5)
+    return {{1000, L"返回"}, {50, L"减少显示数量"},
+            {0, L"最多显示的最近会话数"}, {51, L"增加显示数量"},
+            {52, L"恢复默认 3 个"}};
   return {{1, L"显示或收起会话"}, {15, L"固定会话面板"},
-          {100, L"宠物大小"},     {101, L"面板大小"},
+          {100, L"宠物大小"},     {101, L"会话面板"},
           {102, L"文字显示"},     {103, L"背景材质"},
           {14, L"恢复所有默认大小"},
           {3, L"素材来源与许可"}, {4, L"退出桌宠"}};
@@ -125,6 +130,12 @@ void Icon(int id, float x, float y, ID2D1SolidColorBrush *b) {
     }
     return;
   }
+  if (id == 104) {
+    for (int i = -1; i <= 1; ++i)
+      line(-8, i * 5.f, i == 1 ? 1.f : 8.f, i * 5.f);
+    Label(L"#", x + 1, y - 1, 12, 12, b->GetColor(), true);
+    return;
+  }
   if (id == 15) {
     line(-6, -7, 6, -7);
     line(-4, -7, -4, 0);
@@ -153,7 +164,7 @@ void Icon(int id, float x, float y, ID2D1SolidColorBrush *b) {
     line(-3, -7, -3, 7);
     return;
   }
-  if (id == 14 || id == 16 || id == 17) {
+  if (id == 14 || id == 16 || id == 17 || id == 52) {
     ComPtr<ID2D1PathGeometry> path;
     ComPtr<ID2D1GeometrySink> sink;
     if (FAILED(graphics->CreatePathGeometry(&path)) || FAILED(path->Open(&sink)))
@@ -212,9 +223,9 @@ void Icon(int id, float x, float y, ID2D1SolidColorBrush *b) {
     line(-5, 0, 2, 7);
     return;
   }
-  if (id == 10 || id == 12 || id == 11 || id == 13) {
+  if (id == 10 || id == 12 || id == 11 || id == 13 || id == 50 || id == 51) {
     line(-7, 0, 7, 0);
-    if (id == 11 || id == 13)
+    if (id == 11 || id == 13 || id == 51)
       line(0, -7, 0, 7);
     return;
   }
@@ -240,7 +251,8 @@ void Icon(int id, float x, float y, ID2D1SolidColorBrush *b) {
     return;
   }
   auto state = getState();
-  Label(page == 1 ? std::to_wstring(state.petSize)
+  Label(page == 5 ? std::to_wstring(state.sessionRows)
+        : page == 1 ? std::to_wstring(state.petSize)
                   : std::to_wstring(state.panelPercent) + L"%",
         x - 18, y - 8, 36, 11, D2D1::ColorF(PetTheme::Muted), true);
 }
@@ -313,14 +325,17 @@ void Paint() {
     std::wstring hint = current >= 0 && current < (int)items.size()
                             ? items[current].name
                         : page == 1 ? L"宠物大小"
-                        : page == 2 ? L"面板大小"
+                        : page == 2 ? L"会话面板"
                         : page == 3 ? L"文字显示"
                         : page == 4 ? L"背景材质 · " + std::wstring(BackdropName(state.backdrop))
+                        : page == 5 ? L"最多显示最近会话"
                                     : L"会话与显示设置";
     if (page == 1)
       hint += L" · " + std::to_wstring(state.petSize);
     if (page == 2)
       hint += L" · " + std::to_wstring(state.panelPercent) + L"%";
+    if (page == 5)
+      hint += L" · " + std::to_wstring(state.sessionRows) + L" 个";
     Label(hint, 8, 46, Width() - 16, 10, D2D1::ColorF(PetTheme::Muted), true);
     if (canvas->EndDraw() == D2DERR_RECREATE_TARGET)
       canvas.Reset();
@@ -352,8 +367,8 @@ void Activate(int index) {
   if (index < 0 || index >= (int)items.size() || !items[index].id)
     return;
   int id = items[index].id;
-  if (id == 100 || id == 101 || id == 102 || id == 103 || id == 1000) {
-    page = id == 100 ? 1 : id == 101 ? 2 : id == 102 ? 3 : id == 103 ? 4 : 0;
+  if (id == 100 || id == 101 || id == 102 || id == 103 || id == 104 || id == 1000) {
+    page = id == 100 ? 1 : id == 101 ? 2 : id == 102 ? 3 : id == 103 ? 4 : id == 104 ? 5 : page == 5 ? 2 : 0;
     hovered = pressed = -1;
     focus = 0;
     ClearInteractionFeedback(window);

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(ZCodePet VERSION 0.2.0 LANGUAGES CXX)
+project(ZCodePet VERSION 0.2.1 LANGUAGES CXX)
 enable_language(RC)
 configure_file(src/resources.rc.in ${CMAKE_CURRENT_BINARY_DIR}/resources.rc @ONLY)
 set(CMAKE_CXX_STANDARD 20)

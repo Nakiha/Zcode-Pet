@@ -16,6 +16,7 @@ public:
   bool Ready() const noexcept;
   bool SetClip(const std::string &name, bool loop = true) noexcept;
   bool SetState(const std::wstring &state) noexcept;
+  bool PlayDragBounce() noexcept;
   int DesiredFps() const noexcept;
   bool Render(float delta, int side) noexcept;
   bool Snapshot(const std::filesystem::path &path, int side) noexcept;

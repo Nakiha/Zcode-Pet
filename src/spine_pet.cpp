@@ -153,6 +153,9 @@ struct SpinePet::Impl {
   uint64_t frames = 0, changes = 0, errors = 0;
   int vertices = 0, batches = 0, side = 0;
   std::string clip;
+  std::wstring logicalState = L"idle";
+  std::string returnClip;
+  float dragRemaining = 0;
   std::map<std::wstring, std::string> aliases;
   int fps = 30, mixFps = 60;
   std::unique_ptr<TextureLoader> loader;
@@ -475,8 +478,9 @@ bool SpinePet::Initialize(HWND window, const fs::path &folder,
     s.state = std::make_unique<spine::AnimationState>(s.mixes.get());
     const auto config = folder / L"animations.ini";
     const std::pair<const wchar_t *, const wchar_t *> defaults[] = {
-        {L"idle", L"a"},    {L"working", L"d"}, {L"waiting", L"e"},
-        {L"success", L"c"}, {L"paused", L"b"},  {L"thinking", L"b"}};
+        {L"idle", L"a"},     {L"working", L"d"},         {L"waiting", L"e"},
+        {L"success", L"c"},  {L"paused", L"b"},          {L"thinking", L"b"},
+        {L"drag", L"a_win"}, {L"drag_working", L"d_win"}};
     for (const auto &[logical, original] : defaults) {
       wchar_t value[128]{};
       GetPrivateProfileStringW(L"animations", logical, original, value, 128,
@@ -585,6 +589,8 @@ bool SpinePet::SetClip(const std::string &name, bool loop) noexcept {
     entry->setMixAttachmentThreshold(.5f);
     entry->setMixDrawOrderThreshold(.5f);
     s.clip = name;
+    s.dragRemaining = 0;
+    s.returnClip.clear();
     ++s.changes;
     return true;
   } catch (...) {
@@ -597,6 +603,15 @@ bool SpinePet::Render(float delta, int side) noexcept {
   if (!impl->ready)
     return false;
   try {
+    auto &s = *impl;
+    if (s.dragRemaining > 0) {
+      s.dragRemaining -= std::clamp(delta, 0.f, .1f);
+      if (s.dragRemaining <= 0) {
+        const auto next = s.returnClip;
+        if (!SetClip(next))
+          return false;
+      }
+    }
     impl->Draw(delta, side);
     return true;
   } catch (...) {
@@ -607,13 +622,51 @@ bool SpinePet::Render(float delta, int side) noexcept {
 }
 bool SpinePet::SetState(const std::wstring &logical) noexcept {
   const auto found = impl->aliases.find(logical);
-  return SetClip(found == impl->aliases.end() ? "a" : found->second);
+  const auto name = found == impl->aliases.end() ? "a" : found->second;
+  impl->logicalState = logical;
+  if (impl->dragRemaining > 0) {
+    impl->returnClip = name;
+    return true;
+  }
+  return SetClip(name);
+}
+bool SpinePet::PlayDragBounce() noexcept {
+  auto &s = *impl;
+  try {
+    if (!s.ready)
+      return false;
+    const auto found = s.aliases.find(
+        s.logicalState == L"working" ? L"drag_working" : L"drag");
+    if (found == s.aliases.end() ||
+        !s.data->findAnimation(found->second.c_str()))
+      return false;
+    const auto next = s.dragRemaining > 0 ? s.returnClip : s.clip;
+    // A second, distinct drag can restart the reaction, including during the
+    // previous bounce. Mouse move events within one drag never call this again.
+    if (s.clip == found->second)
+      s.clip.clear();
+    if (!SetClip(found->second, false))
+      return false;
+    const auto entry = s.state->getCurrent(0);
+    entry->setMixDuration(.08f);
+    // a_win contains a 1.0667s pickup bounce followed by a long idle tail;
+    // d_win is the matching working pose. Play only the native bounce section.
+    entry->setAnimationEnd(
+        std::min(1.0667f, entry->getAnimation()->getDuration()));
+    s.dragRemaining = entry->getAnimationEnd();
+    s.returnClip = next;
+    return true;
+  } catch (...) {
+    s.result = to_hresult();
+    ++s.errors;
+    return false;
+  }
 }
 int SpinePet::DesiredFps() const noexcept {
   const auto &s = *impl;
   auto entry = s.state ? s.state->getCurrent(0) : nullptr;
-  return entry && entry->getMixingFrom() &&
-                 entry->getMixTime() < entry->getMixDuration()
+  return s.dragRemaining > 0 || (entry && entry->getMixingFrom() &&
+                                 entry->getMixTime() < entry->getMixDuration())
              ? s.mixFps
              : s.fps;
 }
@@ -680,6 +733,9 @@ void SpinePet::Shutdown() noexcept {
   s.vertexCapacity = s.indexCapacity = 0;
   s.side = 0;
   s.clip.clear();
+  s.logicalState = L"idle";
+  s.returnClip.clear();
+  s.dragRemaining = 0;
   s.canvas.Reset();
 }
 LRESULT SpinePet::Metric(unsigned f) const noexcept {
@@ -714,6 +770,18 @@ bool RenderSpinePreview(const fs::path &folder, const fs::path &output,
     for (int i = 0; i < 45; ++i)
       okay &= pet.Render(1.f / 30, 512);
     okay &= pet.Snapshot(output / (name + ".png"), 512);
+  }
+  for (const auto &logical : {L"idle", L"working"}) {
+    okay &= pet.SetState(logical);
+    for (int i = 0; i < 4; ++i)
+      okay &= pet.Render(.1f, 512);
+    okay &= pet.PlayDragBounce();
+    const auto sequence = output / (std::wstring(L"drag-") + logical);
+    fs::create_directories(sequence);
+    for (int i = 0; i < 18; ++i) {
+      okay &= pet.Snapshot(sequence / (std::to_wstring(i) + L".png"), 512);
+      okay &= pet.Render(1.f / 12, 512);
+    }
   }
   pet.Shutdown();
   DestroyWindow(window);
@@ -796,6 +864,28 @@ bool SpineLifecycleTests(const fs::path &folder) {
     for (int frame = 0; frame < 6 && okay; ++frame)
       okay &= pet.Render(.05f, 224);
     okay &= pet.DesiredFps() == 30 && pet.Metric(6) == 0;
+    if (cycle == 0) {
+      okay &= pet.PlayDragBounce() && pet.CurrentClip() == "d_win" &&
+              pet.DesiredFps() == 60;
+      okay &= pet.Render(.1f, 224);
+      const auto transitions = pet.Metric(5);
+      // A snapshot/state refresh must neither cancel nor replay the reaction;
+      // its latest state becomes the return pose when the native bounce ends.
+      okay &= pet.SetState(L"waiting") && pet.SetState(L"waiting") &&
+              pet.CurrentClip() == "d_win" && pet.Metric(5) == transitions;
+      for (int i = 0; i < 14; ++i)
+        okay &= pet.Render(.1f, 224);
+      okay &= pet.CurrentClip() == "e" && pet.DesiredFps() == 30;
+      okay &= pet.PlayDragBounce() && pet.CurrentClip() == "a_win";
+      okay &= pet.Render(.1f, 224);
+      const auto firstDrag = pet.Metric(5);
+      okay &= pet.PlayDragBounce() && pet.Metric(5) == firstDrag + 1;
+      okay &= pet.SetState(L"working");
+      for (int i = 0; i < 15; ++i)
+        okay &= pet.Render(.1f, 224);
+      okay &= pet.CurrentClip() == "d" && pet.DesiredFps() == 30 &&
+              pet.Metric(6) == 0;
+    }
     pet.Shutdown();
     const auto resources = GetGuiResources(GetCurrentProcess(), GR_GDIOBJECTS);
     if (cycle == 0)

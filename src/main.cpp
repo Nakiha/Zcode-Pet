@@ -112,12 +112,26 @@ struct PanelTextureCache {
 } panelTexture;
 std::optional<PanelScene> lastPanelScene;
 Snapshot snapshot;
-int VisibleRows() { return std::clamp((int)snapshot.sessions.size(), 1, 3); }
+int sessionRows = DefaultSessionRows;
+int VisibleRows();
 float PanelHeight() { return VisibleRows() * RowHeight; }
 std::mutex dataMutex;
 Snapshot pending;
 std::atomic_bool quitting = false;
 float dpi = 1, petSize = 128, panelZoom = 1.15f;
+int VisibleRows() {
+  int capacity = 10;
+  if (pet) {
+    MONITORINFO monitor{sizeof(monitor)};
+    if (GetMonitorInfoW(MonitorFromWindow(pet, MONITOR_DEFAULTTONEAREST), &monitor)) {
+      const float scale = GetDpiForWindow(pet) / 96.f;
+      const int available = monitor.rcWork.bottom - monitor.rcWork.top -
+                            2 * FloatingScreenPadding(scale);
+      capacity = (int)std::floor(available / (RowHeight * scale * panelZoom));
+    }
+  }
+  return VisibleSessionRows((int)snapshot.sessions.size(), sessionRows, capacity);
+}
 float NoticeFontSize() { return SessionTextSize; }
 float NoticeLineHeight() { return 17.f; }
 float NoticeHeight(const NoticeSurface &notice) {
@@ -144,6 +158,8 @@ void LoadPreferences() {
   backdropMode = ReadBackdropMode((int)GetPrivateProfileIntW(
       L"UI", L"Backdrop", 0, preferencesPath.c_str()));
   spinePreferred=GetPrivateProfileIntW(L"UI",L"Spine",1,preferencesPath.c_str())!=0;
+  sessionRows = ClampSessionRows((int)GetPrivateProfileIntW(
+      L"UI", L"SessionRows", DefaultSessionRows, preferencesPath.c_str()));
   petSize =
       (float)std::clamp((int)GetPrivateProfileIntW(L"Size", L"PetDip", 128,
                                                    preferencesPath.c_str()),
@@ -166,6 +182,8 @@ void SavePreferences() {
   WritePrivateProfileStringW(L"UI", L"Backdrop",
       std::to_wstring((int)backdropMode).c_str(), preferencesPath.c_str());
   WritePrivateProfileStringW(L"UI",L"Spine",spinePreferred ? L"1" : L"0",preferencesPath.c_str());
+  WritePrivateProfileStringW(L"UI", L"SessionRows", std::to_wstring(sessionRows).c_str(),
+                             preferencesPath.c_str());
   WritePrivateProfileStringW(L"Size", L"PetDip",
                              std::to_wstring((int)petSize).c_str(),
                              preferencesPath.c_str());
@@ -182,6 +200,7 @@ constexpr UINT Refresh = WM_APP + 1, Tray = WM_APP + 2,
 constexpr UINT CompositionQuery=WM_APP+36;
 constexpr UINT TrayInfoQuery=WM_APP+38;
 constexpr UINT SpineInfoQuery=WM_APP+40;
+constexpr UINT SessionRowsQuery=WM_APP+42;
 void UseRenderer(bool spine,bool remember=false);
 void UpdateTrayIcon(bool reload=false) {
   HICON previous=trayIcon;
@@ -1105,6 +1124,8 @@ void ReflowPopups() {
   if (!pet)
     return;
   dpi = GetDpiForWindow(pet) / 96.f * panelZoom;
+  scroll = std::clamp(scroll, 0,
+      std::max(0, ((int)snapshot.sessions.size() - VisibleRows()) * (int)RowHeight));
   target.Reset();
   for (auto &notice : notices)
     notice->target.Reset();
@@ -1112,6 +1133,7 @@ void ReflowPopups() {
     PlaceFloating(panel, PanelWidth, PanelHeight(), panelDestination, 6);
     InvalidateRect(panel, nullptr, FALSE);
   }
+  UpdatePanelFeedback();
   PlaceNoticeWindows();
   RefreshToolbarPlacement();
 }
@@ -1155,9 +1177,10 @@ void UpdateAnimation() {
   bool running = snapshot.online &&
                  std::any_of(snapshot.sessions.begin(), snapshot.sessions.end(),
                              [](const auto &s) { return s.running; });
+  const bool spineDrag = spinePet.Ready() && dragging && moved;
   SetAnimation(
       SelectPetAnimation(running, celebrations.Active(now), now < pausedUntil,
-                         hover.wasInside, dragging,
+                         hover.wasInside && !spineDrag, dragging && !spineDrag,
                          std::any_of(
                              snapshot.sessions.begin(), snapshot.sessions.end(),
                              [](const auto &s) { return s.waiting; })));
@@ -1511,9 +1534,16 @@ LRESULT CALLBACK CapsuleProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 }
 ToolbarState ToolbarValues() {
   return {panelPinned, experimental, (int)petSize,
-          (int)std::lround(panelZoom * 100), strength, backdropMode,spinePet.Ready()};
+          (int)std::lround(panelZoom * 100), strength, backdropMode,spinePet.Ready(),sessionRows};
 }
 void ExecuteToolbarAction(int id) {
+  if (id >= 50 && id <= 52) {
+    sessionRows = id == 52 ? DefaultSessionRows
+                          : ClampSessionRows(sessionRows + (id == 51 ? 1 : -1));
+    scroll = 0;
+    ReflowPopups();
+    SavePreferences();
+  }
   if(id==40 || id==41) {UseRenderer(id==40,true);SavePreferences();}
   if (id >= 30 && id <= 32) {
     backdropMode = ReadBackdropMode(id-30);
@@ -1681,6 +1711,8 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     trayRegistered=false;UpdateTrayIcon();return 0;
   }
   switch (msg) {
+  case SessionRowsQuery:
+    return w == 0 ? sessionRows : VisibleRows();
   case SpineInfoQuery:
     return spinePet.Metric((unsigned)w);
   case TrayInfoQuery:
@@ -1798,8 +1830,14 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
       POINT p;
       GetCursorPos(&p);
       int dx = p.x - dragStart.x, dy = p.y - dragStart.y;
-      if (abs(dx) + abs(dy) > 5)
+      if (!moved && abs(dx) + abs(dy) > 5) {
         moved = true;
+        UpdateAnimation();
+        if (spinePet.PlayDragBounce()) {
+          DrawPet();
+          RequestPetFrames(spinePet.DesiredFps());
+        }
+      }
       if (moved) {
         MONITORINFO monitor{sizeof(monitor)};
         if (GetMonitorInfoW(MonitorFromPoint(p, MONITOR_DEFAULTTONEAREST), &monitor)) {
@@ -1825,6 +1863,7 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if (dragging) {
       dragging = false;
       ReleaseCapture();
+      UpdateAnimation();
       DrawPet();
       MoveAttachedPopups();
       if (!moved)
@@ -1834,6 +1873,7 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   case WM_CAPTURECHANGED:
     if (dragging) {
       dragging = false;
+      UpdateAnimation();
       DrawPet();
       MoveAttachedPopups();
     }
@@ -2065,6 +2105,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
       maxNoticeWidth = std::max(maxNoticeWidth, bounds.right - bounds.left);
     }
     f << "panelWidth=" << panelGeometry.right - panelGeometry.left
+      << " panelHeight=" << panelGeometry.bottom - panelGeometry.top
       << " noticeMinWidth=" << (noticeWindows.empty() ? 0 : minNoticeWidth)
       << " noticeMaxWidth=" << maxNoticeWidth << "\n";
     std::vector<RECT> column;
@@ -2197,6 +2238,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
       << " spineHardware=" << SendMessageW(character,SpineInfoQuery,7,0) << "\n";
     f << "petRequestedFps=" << SendMessageW(character,VisualFrameInfoQuery,5,0)
       << " panelContinuousFrames=" << SendMessageW(character,VisualFrameInfoQuery,6,0) << "\n";
+    f << "sessionRowLimit=" << SendMessageW(character,SessionRowsQuery,0,0)
+      << " sessionVisibleRows=" << SendMessageW(character,SessionRowsQuery,1,0) << "\n";
     return s.error.empty() ? 0 : 2;
   }
   if (wcsstr(command, L"--quit")) {
