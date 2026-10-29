@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(ZCodePet VERSION 0.2.1 LANGUAGES CXX)
+project(ZCodePet VERSION 0.2.2 LANGUAGES CXX)
 enable_language(RC)
 configure_file(src/resources.rc.in ${CMAKE_CURRENT_BINARY_DIR}/resources.rc @ONLY)
 set(CMAKE_CXX_STANDARD 20)
@@ -16,7 +16,12 @@ target_link_libraries(ZCodePet PRIVATE spine-cpp d3dcompiler windowscodecs)
 target_compile_definitions(ZCodePet PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(ZCodePet PRIVATE /utf-8 /W4 /EHsc)
 target_link_libraries(ZCodePet PRIVATE d2d1 dwrite dwmapi gdiplus shell32 ole32 oleaut32 user32 gdi32 dxgi uiautomationcore d3d11 windowsapp CoreMessaging)
-add_custom_command(TARGET ZCodePet POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/assets" "$<TARGET_FILE_DIR:ZCodePet>/assets")
+add_custom_command(TARGET ZCodePet POST_BUILD
+  COMMAND ${CMAKE_COMMAND}
+    "-DSOURCE_ASSETS=${CMAKE_SOURCE_DIR}/assets"
+    "-DTARGET_ASSETS=$<TARGET_FILE_DIR:ZCodePet>/assets"
+    "-DBINARY_ROOT=${CMAKE_BINARY_DIR}"
+    -P "${CMAKE_SOURCE_DIR}/scripts/copy-assets.cmake")
 enable_testing()
 add_test(NAME observer COMMAND ZCodePet --self-test)
 add_test(NAME presentation COMMAND ZCodePet --presentation-test)

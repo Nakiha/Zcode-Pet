@@ -168,14 +168,13 @@ inline std::wstring CompactPreview(const std::wstring &raw) {
 
 inline const wchar_t *SelectPetAnimation(bool running, bool success,
                                          bool failed, bool inside,
-                                         bool dragging, bool waiting = false) {
+                                         bool waiting = false) {
   if (success)
     return L"success";
   if (waiting)
     return L"waiting";
   return running    ? L"working"
          : failed   ? L"paused"
-         : dragging ? L"paused"
          : inside   ? L"waiting"
                     : L"idle";
 }
@@ -316,7 +315,7 @@ inline bool PresentationTests() {
           L"success" ||
       std::wstring(SelectPetAnimation(true, false, false, false, false)) !=
           L"working" ||
-      std::wstring(SelectPetAnimation(true, true, false, false, false, true)) !=
+      std::wstring(SelectPetAnimation(true, true, false, false, true)) !=
           L"success" ||
       std::wstring(SelectPetAnimation(false, true, false, false, false)) !=
           L"success" ||
@@ -325,7 +324,7 @@ inline bool PresentationTests() {
       std::wstring(SelectPetAnimation(false, false, false, true, false)) !=
           L"waiting" ||
       std::wstring(SelectPetAnimation(false, false, false, true, true)) !=
-          L"paused" ||
+          L"waiting" ||
       std::wstring(SelectPetAnimation(false, false, false, false, false)) !=
           L"idle")
     return false;

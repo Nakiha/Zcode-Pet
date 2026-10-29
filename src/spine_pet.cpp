@@ -479,7 +479,7 @@ bool SpinePet::Initialize(HWND window, const fs::path &folder,
     const auto config = folder / L"animations.ini";
     const std::pair<const wchar_t *, const wchar_t *> defaults[] = {
         {L"idle", L"a"},     {L"working", L"d"},         {L"waiting", L"e"},
-        {L"success", L"c"},  {L"paused", L"b"},          {L"thinking", L"b"},
+        {L"success", L"c"},  {L"paused", L"b"},
         {L"drag", L"a_win"}, {L"drag_working", L"d_win"}};
     for (const auto &[logical, original] : defaults) {
       wchar_t value[128]{};

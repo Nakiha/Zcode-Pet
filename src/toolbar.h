@@ -9,7 +9,6 @@ struct ToolbarState {
   int petSize = 128, panelPercent = 115;
   float strength = .75f;
   BackdropMode backdrop = BackdropMode::Acrylic;
-  bool spine=false;
   int sessionRows = 3;
 };
 void InitToolbar(HWND owner, ID2D1Factory *graphics, IDWriteFactory *text,

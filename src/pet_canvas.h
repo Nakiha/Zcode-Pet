@@ -4,7 +4,7 @@
 inline void KeepRectangularPetHitArea(void *pixels, size_t count) {
   auto data = static_cast<DWORD *>(pixels);
   // WS_EX_LAYERED 的 alpha=0 像素会直接穿透，WM_NCHITTEST 无法补回。
-  // 最低非零 alpha 稳定整个矩形的命中；不能随 GIF 当前轮廓改变交互区。
+  // 最低非零 alpha 稳定整个矩形的命中；不能随角色当前轮廓改变交互区。
   for (size_t i = 0; i < count; ++i)
     if ((data[i] & 0xff000000) == 0)
       data[i] = 0x01000000;

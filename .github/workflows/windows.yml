@@ -21,6 +21,7 @@ jobs:
           Copy-Item README.md build/Release/README.md
           Copy-Item third_party/json.LICENSE build/Release/JSON-LICENSE.txt
           Copy-Item third_party/spine-cpp/LICENSE build/Release/SPINE-RUNTIME-LICENSE.txt
+          Copy-Item docs build/Release/docs -Recurse
       - uses: actions/upload-artifact@v4
         with:
           name: ZCodePet-windows-x64
@@ -29,3 +30,4 @@ jobs:
             build/Release/assets/
             build/Release/README.md
             build/Release/*LICENSE.txt
+            build/Release/docs/

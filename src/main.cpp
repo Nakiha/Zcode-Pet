@@ -84,13 +84,12 @@ bool navigationPreview = false;
 BackdropMode backdropMode = BackdropMode::Acrylic;
 std::wstring gpuProfileScene;
 bool gpuProfileNoAcrylic=false,gpuProfileNoShimmer=false,gpuProfileNoSpinner=false,
-     gpuProfileFrozenGif=false,gpuProfilePetOnly=false;
+     gpuProfileFrozenPet=false,gpuProfilePetOnly=false;
 bool gpuProfileNoCache = false;
 bool gpuProfileNoMask = false;
 bool gpuProfileLegacy = false;
 PanelComposition panelComposition;
 SpinePet spinePet;
-bool spinePreferred=true;
 bool spineHardware=false;
 double lastSpineFrame=0;
 uint64_t panelDraws=0,noticeDraws=0,petDraws=0,visualFrames=0;
@@ -143,10 +142,6 @@ bool dragging = false, moved = false;
 POINT dragStart{}, petStart{};
 bool experimental = false;
 float strength = .75f;
-std::unique_ptr<Gdiplus::Image> animation;
-PetCanvasBuffer petCanvas;
-std::vector<UINT> delays;
-UINT frame = 0, count = 0;
 std::wstring animationName;
 void LoadPreferences() {
   wchar_t local[32768];
@@ -157,7 +152,6 @@ void LoadPreferences() {
                                       preferencesPath.c_str()) != 0;
   backdropMode = ReadBackdropMode((int)GetPrivateProfileIntW(
       L"UI", L"Backdrop", 0, preferencesPath.c_str()));
-  spinePreferred=GetPrivateProfileIntW(L"UI",L"Spine",1,preferencesPath.c_str())!=0;
   sessionRows = ClampSessionRows((int)GetPrivateProfileIntW(
       L"UI", L"SessionRows", DefaultSessionRows, preferencesPath.c_str()));
   petSize =
@@ -181,7 +175,7 @@ void SavePreferences() {
                              preferencesPath.c_str());
   WritePrivateProfileStringW(L"UI", L"Backdrop",
       std::to_wstring((int)backdropMode).c_str(), preferencesPath.c_str());
-  WritePrivateProfileStringW(L"UI",L"Spine",spinePreferred ? L"1" : L"0",preferencesPath.c_str());
+  WritePrivateProfileStringW(L"UI", L"Spine", nullptr, preferencesPath.c_str());
   WritePrivateProfileStringW(L"UI", L"SessionRows", std::to_wstring(sessionRows).c_str(),
                              preferencesPath.c_str());
   WritePrivateProfileStringW(L"Size", L"PetDip",
@@ -201,7 +195,7 @@ constexpr UINT CompositionQuery=WM_APP+36;
 constexpr UINT TrayInfoQuery=WM_APP+38;
 constexpr UINT SpineInfoQuery=WM_APP+40;
 constexpr UINT SessionRowsQuery=WM_APP+42;
-void UseRenderer(bool spine,bool remember=false);
+bool InitializePetRenderer(bool hardware);
 void UpdateTrayIcon(bool reload=false) {
   HICON previous=trayIcon;
   const bool previousOwned=trayIconOwned;
@@ -926,90 +920,53 @@ void ClampPetPosition() {
     SetWindowPos(pet, nullptr, position.x, position.y, 0, 0,
                  SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
 }
-void DrawPet() {
+bool DrawPet() {
   ++petDraws;
-  if(spinePet.Ready()) {
-    spinePet.Render(0,(int)(petSize*GetDpiForWindow(pet)/96.f));
-    lastSpineFrame=VisualClockMs();
-    ClampPetPosition();
-    return;
-  }
-  if (!animation)
-    return;
-  int side = (int)(petSize * GetDpiForWindow(pet) / 96.f);
-  HDC screen = GetDC(nullptr);
-  if (!petCanvas.Ensure(screen, side)) {
-    ReleaseDC(nullptr, screen);
-    return;
-  }
-  memset(petCanvas.pixels, 0, (size_t)side * side * 4);
-  {
-    Gdiplus::Graphics g(petCanvas.dc);
-    g.SetCompositingMode(Gdiplus::CompositingModeSourceCopy);
-    g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-    float ratio = std::min((float)side / animation->GetWidth(),
-                           (float)side / animation->GetHeight());
-    float w = animation->GetWidth() * ratio, h = animation->GetHeight() * ratio;
-    g.DrawImage(animation.get(), (side - w) / 2, (side - h) / 2, w, h);
-  }
-  POINT origin{0, 0};
-  SIZE size{side, side};
-  KeepRectangularPetHitArea(petCanvas.pixels,(size_t)side*side);
-  BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-  UpdateLayeredWindow(pet, screen, nullptr, &size, petCanvas.dc, &origin, 0, &blend,
-                      ULW_ALPHA);
-  ReleaseDC(nullptr, screen);
+  if (!spinePet.Ready() ||
+      !spinePet.Render(0, (int)(petSize * GetDpiForWindow(pet) / 96.f)))
+    return false;
+  lastSpineFrame = VisualClockMs();
   ClampPetPosition();
+  return true;
 }
-void SetAnimation(const std::wstring &name) {
+bool SetAnimation(const std::wstring &name) {
   if (name == animationName)
-    return;
-  if(spinePet.Ready()) {
-    if(spinePet.SetState(name)) {
-      animationName=name;DrawPet();
-      RequestPetFrames(gpuProfileFrozenGif ? 0 : spinePet.DesiredFps());
-    }
-    return;
-  }
-  auto image = std::make_unique<Gdiplus::Image>(
-      (base / L"assets" / (name + L".gif")).c_str());
-  if (image->GetLastStatus() != Gdiplus::Ok)
-    return;
-  animation = std::move(image);
+    return true;
+  if (!spinePet.Ready() || !spinePet.SetState(name))
+    return false;
   animationName = name;
-  frame = 0;
-  count = animation->GetFrameCount(&Gdiplus::FrameDimensionTime);
-  delays.assign(std::max(1u, count), 100);
-  UINT n = animation->GetPropertyItemSize(PropertyTagFrameDelay);
-  if (n) {
-    std::vector<BYTE> mem(n);
-    auto p = (Gdiplus::PropertyItem *)mem.data();
-    if (animation->GetPropertyItem(PropertyTagFrameDelay, n, p) ==
-        Gdiplus::Ok) {
-      auto v = (UINT *)p->value;
-      for (UINT i = 0; i < count && i < p->length / 4; ++i)
-        delays[i] = std::clamp(v[i] * 10, 20u, 10000u);
-    }
-  }
-  DrawPet();
-  if (gpuProfileFrozenGif) KillTimer(pet,1);
-  else SetTimer(pet, 1, delays[0], nullptr);
+  const bool drawn = DrawPet();
+  RequestPetFrames(gpuProfileFrozenPet ? 0 : spinePet.DesiredFps());
+  return drawn;
 }
-void UseRenderer(bool spine,bool remember) {
-  if(remember)spinePreferred=spine;
-  if((spine && spinePet.Ready()) || (!spine && animation))return;
-  const auto logical=animationName.empty() ? L"idle" : animationName;
-  RequestPetFrames(0);KillTimer(pet,1);
-  spinePet.Shutdown();animation.reset();petCanvas.Reset();animationName.clear();
-  auto style=GetWindowLongPtrW(pet,GWL_EXSTYLE);
-  auto applyStyle=[&](bool native) {
-    SetWindowLongPtrW(pet,GWL_EXSTYLE,native ? (style&~WS_EX_LAYERED)|WS_EX_NOREDIRECTIONBITMAP
-                                           : (style&~WS_EX_NOREDIRECTIONBITMAP)|WS_EX_LAYERED);
-    SetWindowPos(pet,nullptr,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED);
+bool InitializePetRenderer(bool hardware) {
+  const auto logical = animationName.empty() ? L"idle" : animationName;
+  RequestPetFrames(0);
+  spinePet.Shutdown();
+  animationName.clear();
+  auto applyStyle = [&](bool native) {
+    const auto style = GetWindowLongPtrW(pet, GWL_EXSTYLE);
+    SetWindowLongPtrW(pet, GWL_EXSTYLE,
+        native ? (style & ~WS_EX_LAYERED) | WS_EX_NOREDIRECTIONBITMAP
+               : (style & ~WS_EX_NOREDIRECTIONBITMAP) | WS_EX_LAYERED);
+    SetWindowPos(pet, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
   };
-  applyStyle(spine && spineHardware);
-  if(spine && !spinePet.Initialize(pet,base/L"assets/spine",spineHardware))applyStyle(false);
-  SetAnimation(logical);
+  spineHardware = hardware;
+  applyStyle(hardware);
+  if (!spinePet.Initialize(pet, base / L"assets/spine", hardware)) {
+    if (!hardware)
+      return false;
+    // The optional D3D backend can recover through the same Spine software
+    // renderer. Character resources are required in either path.
+    spineHardware = false;
+    applyStyle(false);
+    if (!spinePet.Initialize(pet, base / L"assets/spine", false))
+      return false;
+  }
+  if (SetAnimation(logical))
+    return true;
+  return hardware && InitializePetRenderer(false);
 }
 void DismissPanel() {
   if (panelPinned) {
@@ -1177,10 +1134,9 @@ void UpdateAnimation() {
   bool running = snapshot.online &&
                  std::any_of(snapshot.sessions.begin(), snapshot.sessions.end(),
                              [](const auto &s) { return s.running; });
-  const bool spineDrag = spinePet.Ready() && dragging && moved;
   SetAnimation(
       SelectPetAnimation(running, celebrations.Active(now), now < pausedUntil,
-                         hover.wasInside && !spineDrag, dragging && !spineDrag,
+                         hover.wasInside && !(dragging && moved),
                          std::any_of(
                              snapshot.sessions.begin(), snapshot.sessions.end(),
                              [](const auto &s) { return s.waiting; })));
@@ -1534,7 +1490,7 @@ LRESULT CALLBACK CapsuleProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
 }
 ToolbarState ToolbarValues() {
   return {panelPinned, experimental, (int)petSize,
-          (int)std::lround(panelZoom * 100), strength, backdropMode,spinePet.Ready(),sessionRows};
+          (int)std::lround(panelZoom * 100), strength, backdropMode,sessionRows};
 }
 void ExecuteToolbarAction(int id) {
   if (id >= 50 && id <= 52) {
@@ -1544,7 +1500,6 @@ void ExecuteToolbarAction(int id) {
     ReflowPopups();
     SavePreferences();
   }
-  if(id==40 || id==41) {UseRenderer(id==40,true);SavePreferences();}
   if (id >= 30 && id <= 32) {
     backdropMode = ReadBackdropMode(id-30);
     SendMessageW(panel,BackdropChanged,0,0);
@@ -1566,10 +1521,12 @@ void ExecuteToolbarAction(int id) {
     experimental = id == 20 ? false : id == 21 ? true : !experimental;
     InvalidateRect(panel, nullptr, FALSE);
   }
-  if (id == 3)
+  if (id == 3) {
+    const auto credits = base / L"assets/spine/ATTRIBUTION.txt";
     ShellExecuteW(nullptr, L"open",
-                  L"https://github.com/ZanyZebra1127/Little-Remielle", nullptr,
+                  credits.c_str(), nullptr,
                   nullptr, SW_SHOWNORMAL);
+  }
   if (id >= 5 && id <= 7) {
     strength = id == 5 ? .5f : id == 6 ? .75f : 1.f;
     experimental = true;
@@ -1770,14 +1727,19 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   case VisualFrameMessage:
     ++visualFrames;
     BeginVisualFrame();
-    if(spinePet.Ready() && !gpuProfileFrozenGif) {
+    if(spinePet.Ready() && !gpuProfileFrozenPet) {
       const auto now=VisualClockMs();
       const auto interval=1000./spinePet.DesiredFps();
       if(w==1 || now-lastSpineFrame>=interval-.25) {
         const auto delta=(float)((now-lastSpineFrame)/1000.);
         if(spinePet.Render(delta,(int)(petSize*GetDpiForWindow(pet)/96.f))) {
           ++petDraws;lastSpineFrame=now;
-        } else UseRenderer(false);
+        } else if (!InitializePetRenderer(false)) {
+          MessageBoxW(pet, L"Spine 角色渲染失败，请重新启动桌宠。",
+                      L"ZCode Pet", MB_ICONERROR);
+          DestroyWindow(pet);
+          return 0;
+        }
       }
       RequestPetFrames(spinePet.Ready() ? spinePet.DesiredFps() : 0);
     }
@@ -1805,13 +1767,6 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
     if (w == 2) {
       HoverTick();
       return 0;
-    }
-    if (gpuProfileFrozenGif && w==1) return 0;
-    if (animation && count) {
-      frame = (frame + 1) % count;
-      animation->SelectActiveFrame(&Gdiplus::FrameDimensionTime, frame);
-      DrawPet();
-      SetTimer(h, 1, delays[frame], nullptr);
     }
     return 0;
   case WM_LBUTTONDOWN: {
@@ -2254,7 +2209,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
     const auto end=wcspbrk(value,L" \t");
     gpuProfileScene.assign(value,end ? end-value : wcslen(value));
     gpuProfilePetOnly=gpuProfileScene.rfind(L"pet",0)==0;
-    gpuProfileFrozenGif=gpuProfileScene.find(L"frozen")!=std::wstring::npos;
+    gpuProfileFrozenPet=gpuProfileScene.find(L"frozen")!=std::wstring::npos;
     gpuProfileNoAcrylic=gpuProfileScene.find(L"no-acrylic")!=std::wstring::npos;
     gpuProfileNoShimmer=gpuProfileScene.find(L"no-shimmer")!=std::wstring::npos;
     gpuProfileNoSpinner=gpuProfileScene.find(L"no-spinner")!=std::wstring::npos;
@@ -2326,11 +2281,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   InitToolbar(pet, factory.Get(), writeFactory.Get(), ToolbarValues,
               ExecuteToolbarAction, ApplySurfaceMaterial, ToolbarObstacles, preview);
   UpdateTrayIcon();
-  const bool forceGif=wcsstr(command,L"--gif") || gpuProfileScene.find(L"gif")!=std::wstring::npos;
   spineHardware=wcsstr(command,L"--spine-gpu") || gpuProfileScene.find(L"spine-gpu")!=std::wstring::npos;
-  UseRenderer((!gpuProfileScene.empty() || spinePreferred || spineHardware) && !forceGif);
-  if (!spinePet.Ready() && !animation) {
-    MessageBoxW(nullptr, L"缺少 assets/idle.gif，请保持素材目录和 EXE 在一起。",
+  if (!InitializePetRenderer(spineHardware)) {
+    MessageBoxW(nullptr, L"无法加载 Spine 角色，请保持完整的 assets/spine 目录与 EXE 在一起。",
                 L"ZCode Pet", MB_ICONERROR);
     DestroyWindow(pet);
   } else
@@ -2479,8 +2432,6 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   }
   notices.clear();
   DestroyWindow(panel);
-  animation.reset();
-  petCanvas.Reset();
   panelTexture.Reset();
   target.Reset();
   writeFactory.Reset();

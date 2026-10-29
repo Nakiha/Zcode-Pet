@@ -3,7 +3,7 @@ param(
   [Parameter(Mandatory=$true)][string]$OutputDirectory,
   [string]$RestoreExe,
   [int]$Samples=6,
-  [string[]]$Scenes=@('pet-frozen','pet','static','running','running-no-shimmer','running-no-spinner','running-no-acrylic','running-frozen-gif','running-no-shimmer-no-spinner','running')
+  [string[]]$Scenes=@('pet-frozen','pet','static','running','running-no-shimmer','running-no-spinner','running-no-acrylic','running-frozen','running-no-shimmer-no-spinner','running')
 )
 $ErrorActionPreference='Stop'
 $Exe=(Resolve-Path -LiteralPath $Exe).Path

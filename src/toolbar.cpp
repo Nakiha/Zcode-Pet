@@ -37,8 +37,7 @@ std::vector<Item> Items() {
             {10, L"宠物缩小"},
             {0, L"宠物当前尺寸"},
             {11, L"宠物放大"},
-            {16, L"恢复宠物默认大小"},
-            {40,L"Spine · 动画平滑衔接"},{41,L"GIF · 原始逐帧素材"}};
+            {16, L"恢复宠物默认大小"}};
   if (page == 2)
     return {{1000, L"返回"},
             {12, L"面板缩小"},
@@ -96,10 +95,6 @@ void Label(const std::wstring &value, float x, float y, float width, float size,
                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 void Icon(int id, float x, float y, ID2D1SolidColorBrush *b) {
-  if(id==40 || id==41) {
-    Label(id==40 ? L"Sk" : L"GIF",x-18,y-10,36,id==40 ? 16.f : 12.f,b->GetColor(),true);
-    return;
-  }
   auto line = [&](float a, float c, float d, float e) {
     canvas->DrawLine(D2D1::Point2F(x + a, y + c), D2D1::Point2F(x + d, y + e),
                      b, 1.55f);
@@ -257,8 +252,7 @@ void Icon(int id, float x, float y, ID2D1SolidColorBrush *b) {
         x - 18, y - 8, 36, 11, D2D1::ColorF(PetTheme::Muted), true);
 }
 bool Selected(int id, const ToolbarState &s) {
-  return (id==40 && s.spine) || (id==41 && !s.spine) ||
-         (id >= 30 && id <= 32 && id-30 == (int)s.backdrop) ||
+  return (id >= 30 && id <= 32 && id-30 == (int)s.backdrop) ||
          (id == 15 && s.pinned) || (id == 20 && !s.subpixel) ||
          (id == 21 && s.subpixel) ||
          (s.subpixel && ((id == 5 && s.strength < .6f) ||
