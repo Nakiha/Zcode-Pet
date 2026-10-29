@@ -23,6 +23,65 @@ std::wstring Wide(const std::string &s) {
   MultiByteToWideChar(CP_UTF8, 0, s.data(), (int)s.size(), r.data(), n);
   return r;
 }
+// One scratch decoder per Read, shared by all its frames. Buffers are released
+// when the batch ends, rather than retaining 32 MiB per session while idle.
+struct FrameDecoder {
+  static constexpr size_t limit = 32 * 1024 * 1024;
+  std::unique_ptr<ZSTD_DCtx, decltype(&ZSTD_freeDCtx)> context{
+      ZSTD_createDCtx(), ZSTD_freeDCtx};
+  std::unique_ptr<char[]> buffer;
+  size_t capacity = 0, allocations = 0;
+  void Grow(size_t wanted, size_t used) {
+    if (wanted <= capacity)
+      return;
+    // Deliberately default-initialize bytes: make_unique<char[]> / vector(size)
+    // would zero the entire allocation before zstd overwrites it.
+    std::unique_ptr<char[]> next(new char[wanted]);
+    if (used)
+      memcpy(next.get(), buffer.get(), used);
+    buffer = std::move(next);
+    capacity = wanted;
+    ++allocations;
+  }
+  size_t Decode(const char *data, size_t frame) {
+    auto length = ZSTD_getFrameContentSize(data, frame);
+    if (length == ZSTD_CONTENTSIZE_ERROR)
+      throw std::runtime_error("invalid frame");
+    if (length != ZSTD_CONTENTSIZE_UNKNOWN && length > limit)
+      throw std::runtime_error("oversize frame");
+    if (!context ||
+        ZSTD_isError(ZSTD_DCtx_reset(context.get(), ZSTD_reset_session_only)))
+      throw std::runtime_error("decoder initialization failed");
+    Grow(length == ZSTD_CONTENTSIZE_UNKNOWN
+             ? 128 * 1024
+             : std::max<size_t>(1, (size_t)length),
+         0);
+    ZSTD_inBuffer input{data, frame, 0};
+    size_t used = 0;
+    for (;;) {
+      // One sentinel byte allows a frame of exactly limit bytes to flush its
+      // footer without incorrectly rejecting it as oversized.
+      if (used == capacity)
+        Grow(std::min(capacity * 2, limit + 1), used);
+      ZSTD_outBuffer output{buffer.get(), capacity, used};
+      auto before = input.pos;
+      auto status = ZSTD_decompressStream(context.get(), &output, &input);
+      if (ZSTD_isError(status) || output.pos > limit)
+        throw std::runtime_error(ZSTD_isError(status)
+                                     ? ZSTD_getErrorName(status)
+                                     : "oversize frame");
+      bool progress = input.pos != before || output.pos != used;
+      used = output.pos;
+      if (!status) {
+        if (input.pos != frame)
+          throw std::runtime_error("trailing frame bytes");
+        return used;
+      }
+      if (!progress)
+        throw std::runtime_error("incomplete frame");
+    }
+  }
+};
 struct Fold {
   Session s;
   bool header = false, hidden = false, boundary = false, seeded = false;
@@ -100,7 +159,7 @@ struct Cursor {
   uint64_t offset = 0, observedSize = 0;
   FILETIME written{}, creation{};
   DWORD volume = 0, indexHigh = 0, indexLow = 0;
-  bool failed = false, bufferedReady = false, unavailable=false;
+  bool failed = false, bufferedReady = false, unavailable = false;
   std::vector<char> pending;
   uint64_t target = 0;
   std::optional<Fold> published;
@@ -207,19 +266,13 @@ struct Reader {
         }
       return begin;
     };
+    // Lazy construction keeps unchanged/plain-log reads allocation-free.
+    std::optional<FrameDecoder> decoder;
     auto decode = [&](Fold &fold, const char *data, size_t frame) {
-      auto length = ZSTD_getFrameContentSize(data, frame);
-      if (length == ZSTD_CONTENTSIZE_ERROR)
-        throw std::runtime_error("invalid frame");
-      if (length == ZSTD_CONTENTSIZE_UNKNOWN)
-        length = 32 * 1024 * 1024;
-      if (length > 32 * 1024 * 1024)
-        throw std::runtime_error("oversize frame");
-      std::vector<char> decoded((size_t)length);
-      auto output =
-          ZSTD_decompress(decoded.data(), decoded.size(), data, frame);
-      if (ZSTD_isError(output) ||
-          records(fold, decoded.data(), output) != output)
+      if (!decoder)
+        decoder.emplace();
+      auto output = decoder->Decode(data, frame);
+      if (records(fold, decoder->buffer.get(), output) != output)
         throw std::runtime_error("invalid frame records");
     };
     auto readAt = [&](uint64_t at, size_t length) {
@@ -401,8 +454,9 @@ struct Reader {
       const auto &p = paths[(nextRead + serviced) % paths.size()];
       if (!budget && cursors.at(p).pending.empty())
         break;
-      if (!Read(p, cursors.at(p), budget)){
-        cursors.at(p) = Cursor{};cursors.at(p).unavailable=true;
+      if (!Read(p, cursors.at(p), budget)) {
+        cursors.at(p) = Cursor{};
+        cursors.at(p).unavailable = true;
       }
     }
     deferred = serviced < paths.size();
@@ -507,8 +561,9 @@ Snapshot ObserveDeepSeek(const fs::path &root) {
   auto result = reader.Poll(start != 0, start);
   bool backlog = reader.deferred || (reader.cache && reader.cache->Busy());
   for (const auto &[path, c] : reader.cursors)
-    if (!c.failed && !c.unavailable && ((!c.fold.header && c.target == 0) || c.bufferedReady ||
-                      c.offset + c.pending.size() < c.target))
+    if (!c.failed && !c.unavailable &&
+        ((!c.fold.header && c.target == 0) || c.bufferedReady ||
+         c.offset + c.pending.size() < c.target))
       backlog = true;
   SetHarnessBacklog(backlog);
   return result;
@@ -549,6 +604,82 @@ std::string Frame(const std::string &text) {
   word(((uint32_t)text.size() << 3) | 1, 3);
   out += text;
   return out;
+}
+std::string UnknownFrame(const std::string &text) {
+  std::string out("\x28\xb5\x2f\xfd\x00\x78", 6); // 32 MiB window, no FCS.
+  size_t at = 0;
+  do {
+    auto count = std::min<size_t>(128 * 1024, text.size() - at);
+    auto block = (uint32_t(count) << 3) | (at + count == text.size() ? 1 : 0);
+    for (int i = 0; i < 3; ++i)
+      out += char(block >> (8 * i));
+    out.append(text, at, count);
+    at += count;
+  } while (at < text.size());
+  return out;
+}
+bool FrameDecoderTests(bool benchmark) {
+  try {
+    FrameDecoder decoder;
+    const auto small = UnknownFrame(std::string(1024, 'x'));
+    if (ZSTD_getFrameContentSize(small.data(), small.size()) !=
+        ZSTD_CONTENTSIZE_UNKNOWN)
+      return false;
+    const auto begin = std::chrono::steady_clock::now();
+    for (int i = 0; i < 1000; ++i)
+      if (decoder.Decode(small.data(), small.size()) != 1024 ||
+          decoder.buffer[1023] != 'x')
+        return false;
+    if (decoder.capacity != 128 * 1024 || decoder.allocations != 1)
+      return false;
+    if (benchmark) {
+      std::ofstream out("source-benchmark.txt", std::ios::app);
+      out << "unknown_size_frames=1000\nunknown_size_decode_microseconds="
+          << std::chrono::duration<double, std::micro>(
+                 std::chrono::steady_clock::now() - begin)
+                 .count()
+          << "\nunknown_size_output_capacity=" << decoder.capacity
+          << "\nunknown_size_output_allocations=" << decoder.allocations
+          << "\n";
+    }
+    const std::string payload(1170000, 'y');
+    const auto large = UnknownFrame(payload);
+    if (decoder.Decode(large.data(), large.size()) != payload.size() ||
+        memcmp(decoder.buffer.get(), payload.data(), payload.size()))
+      return false;
+    auto allocated = decoder.allocations;
+    if (decoder.Decode(small.data(), small.size()) != 1024 ||
+        decoder.allocations != allocated)
+      return false;
+    try {
+      decoder.Decode(large.data(), large.size() - 1);
+      return false;
+    } catch (const std::runtime_error &) {
+    }
+    if (decoder.Decode(small.data(), small.size()) != 1024)
+      return false;
+    // Cheap compressed bomb: RLE blocks expand past the 32 MiB output ceiling.
+    std::string bomb("\x28\xb5\x2f\xfd\x00\x78", 6);
+    for (int i = 0; i < 257; ++i) {
+      uint32_t block = (128 * 1024 << 3) | 2 | (i == 256 ? 1 : 0);
+      for (int j = 0; j < 3; ++j)
+        bomb += char(block >> (8 * j));
+      bomb += 'z';
+    }
+    try {
+      decoder.Decode(bomb.data(), bomb.size());
+      return false;
+    } catch (const std::runtime_error &) {
+    }
+    // A valid frame exactly at the ceiling must still succeed.
+    bomb.resize(bomb.size() - 4);
+    bomb[bomb.size() - 4] = char((unsigned char)bomb[bomb.size() - 4] | 1);
+    if (decoder.Decode(bomb.data(), bomb.size()) != FrameDecoder::limit)
+      return false;
+    return true;
+  } catch (const std::exception &) {
+    return false;
+  }
 }
 } // namespace
 bool DataSourceTests(bool benchmark) {
@@ -622,6 +753,14 @@ bool DataSourceTests(bool benchmark) {
       "\xbe\xaa\xa7\x57\x69\x02",
       96);
   if (!write(entropy) || !r.Read(path, c, budget) || c.failed ||
+      c.fold.s.id != L"entropy" || !c.fold.s.running)
+    return false;
+
+  // The same actual compressed block without a content-size field.
+  auto unknownEntropy = entropy;
+  unknownEntropy[4] = 0; // not single-segment, no FCS
+  unknownEntropy[5] = 0; // 1 KiB window instead of the old FCS byte
+  if (!write(unknownEntropy) || !r.Read(path, c, budget) || c.failed ||
       c.fold.s.id != L"entropy" || !c.fold.s.running)
     return false;
 
@@ -701,5 +840,5 @@ bool DataSourceTests(bool benchmark) {
   if (!large.Read(path, c, budget) || c.failed || !c.published ||
       c.published->s.result != L"completed" || c.published->s.turnId != L"3")
     return false;
-  return true;
+  return FrameDecoderTests(benchmark);
 }
