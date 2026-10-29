@@ -11,7 +11,7 @@ list(LENGTH files count)
 if(NOT count EQUAL 1)
   message(FATAL_ERROR "Standalone directory must contain exactly one executable")
 endif()
-foreach(test IN ITEMS embedded-assets spine-model spine-lifecycle)
+foreach(test IN ITEMS embedded-assets spine-model spine-lifecycle data-sources)
   execute_process(COMMAND "${isolated}/ZCodePet.exe" "--${test}-test"
     WORKING_DIRECTORY "${isolated}" RESULT_VARIABLE result TIMEOUT 30)
   if(NOT result EQUAL 0)

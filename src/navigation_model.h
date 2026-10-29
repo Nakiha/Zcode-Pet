@@ -17,7 +17,8 @@ enum class NavigationCode {
   Offscreen,
   AutomationFailed,
   FocusFailed,
-  Cancelled
+  Cancelled,
+  UnsupportedSource
 };
 enum class NavigationAction { None, Invoke, Legacy, Keyboard };
 struct NavigationResult {
@@ -26,7 +27,7 @@ struct NavigationResult {
   NavigationAction action = NavigationAction::None;
 };
 inline bool SameSession(const Session &a, const Session &b) {
-  return a.id == b.id && a.workspace == b.workspace;
+  return a.source == b.source && a.id == b.id && a.workspace == b.workspace;
 }
 inline std::wstring ProjectName(std::wstring path) {
   while (!path.empty() && (path.back() == L'/' || path.back() == L'\\'))
@@ -79,6 +80,7 @@ struct NavigationPreparation {
 };
 inline NavigationPreparation PrepareNavigation(const Session &captured,
                                                const Snapshot &latest) {
+  if(captured.source!=SourceId::ZCode)return {NavigationCode::UnsupportedSource,{}};
   if (!latest.online || !latest.error.empty())
     return {NavigationCode::Unavailable, {}};
   auto found =
@@ -92,7 +94,7 @@ inline NavigationPreparation PrepareNavigation(const Session &captured,
   if (found->projectNameAmbiguous)
     return {NavigationCode::Ambiguous, {}};
   for (const auto &s : latest.sessions)
-    if (!SameSession(s, *found) && s.title == found->title &&
+    if (s.source==found->source && !SameSession(s, *found) && s.title == found->title &&
         SameProject(NavigationProjectName(s), NavigationProjectName(*found)))
       return {NavigationCode::Ambiguous, {}};
   return {NavigationCode::Idle, *found};

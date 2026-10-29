@@ -60,7 +60,7 @@ void ShowEmbeddedLicenses(HWND owner) {
       std::string("CHARACTER CREDITS\r\n\r\n") + EmbeddedText(IDR_PET_CREDITS) +
       "\r\n\r\nSPINE RUNTIMES LICENSE\r\n\r\n" +
       EmbeddedText(IDR_SPINE_LICENSE) +
-      "\r\n\r\nNLOHMANN/JSON LICENSE\r\n\r\n" + EmbeddedText(IDR_JSON_LICENSE);
+      "\r\n\r\nNLOHMANN/JSON LICENSE\r\n\r\n" + EmbeddedText(IDR_JSON_LICENSE)+"\r\n\r\nZSTANDARD LICENSE\r\n\r\n"+EmbeddedText(IDR_ZSTD_LICENSE);
   // A Win32 multiline edit expects CRLF, including notices authored on Unix.
   std::string text;
   text.reserve(source.size());
@@ -88,6 +88,6 @@ bool EmbeddedAssetsTests() {
              std::string::npos &&
          EmbeddedText(IDR_JSON_LICENSE).find("MIT License") !=
              std::string::npos &&
-         !EmbeddedText(IDR_PET_CREDITS).empty() && EmbeddedBytes(65534).empty() &&
+         !EmbeddedText(IDR_PET_CREDITS).empty() && !EmbeddedText(IDR_ZSTD_LICENSE).empty() && EmbeddedBytes(65534).empty() &&
          FindResourceW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(IDD_LICENSES), RT_DIALOG);
 }

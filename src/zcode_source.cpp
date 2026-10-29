@@ -606,7 +606,7 @@ bool EventCursorTests() {
   return cursor.events.empty();
 }
 } // namespace
-Snapshot Observe() {
+Snapshot ObserveZCode() {
   timing = {};
   const auto began = Microseconds();
   Snapshot out;
@@ -698,7 +698,7 @@ Snapshot Observe() {
   return out;
 }
 ObserverTiming LastObserverTiming() { return timing; }
-std::wstring ReadFinalRecap(const Session &session) {
+std::wstring ReadZCodeRecap(const Session &session) {
   wchar_t home[32768];
   if (!GetEnvironmentVariableW(L"USERPROFILE", home, 32768))
     return {};

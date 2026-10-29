@@ -192,6 +192,7 @@ bool Activate(HWND window) {
   return false;
 }
 NavigationResult Open(IUIAutomation *uia, const Session &session, const std::vector<Session> &peers) {
+  if(session.source!=SourceId::ZCode)return {NavigationCode::UnsupportedSource};
   if (!uia)
     return {NavigationCode::AutomationFailed};
   const auto deadline = GetTickCount64() + 6000;

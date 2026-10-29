@@ -1,0 +1,23 @@
+- id: llm-pi-ai
+  config:
+    providers:
+      local-mock:
+        displayName: Local Mock
+        api: openai-completions
+        baseURL: http://127.0.0.1:18766/v1
+        headers:
+          Authorization: Mock-local-only
+        models:
+          - id: mock-chat
+            name: Mock Chat
+            contextWindow: 32768
+- id: agent-default-model
+  name: "@deepseek-ai/dsh-agent-default-model"
+  config:
+    provider: local-mock
+    model: mock-chat
+
+- id: agent-default-model
+  config:
+    provider: local-mock
+    model: mock-chat

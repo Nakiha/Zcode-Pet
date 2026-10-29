@@ -2,8 +2,10 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+enum class SourceId { ZCode, DeepSeek };
 struct Session {
   std::wstring id, workspace, title, path, result;
+  SourceId source = SourceId::ZCode;
   bool running = false, uncertain = false;
   int64_t updated = 0;
   std::wstring turnId;
@@ -19,7 +21,7 @@ struct Session {
 struct Snapshot {
   std::vector<Session> sessions;
   bool online = false;
-  std::wstring error;
+  std::wstring error, sourceWarning;
 };
 Snapshot Observe();
 bool ObserverTests();

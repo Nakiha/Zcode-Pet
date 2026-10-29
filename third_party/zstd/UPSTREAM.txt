@@ -1,0 +1,4 @@
+https://github.com/facebook/zstd
+Commit 49cf51799ea051457f57243527aa2058f999f005
+Decoder amalgamated using upstream build/single_file_libs/combine.py, excluding legacy/zstd_legacy.h.
+Unmodified generated decoder and public zstd.h. BSD license retained and embedded in EXE.

@@ -1,3 +1,4 @@
+#include "data_sources.h"
 #include <windows.h>
 #include "toolbar.h"
 #include "theme.h"
@@ -32,6 +33,9 @@ struct Item {
   const wchar_t *name;
 };
 std::vector<Item> Items() {
+  if (page == 6) {
+    return {{1000,L"返回"},{60,L"ZCode（勾选启用）"},{61,L"DeepSeek Harness（勾选启用）"}};
+  }
   if (page == 1)
     return {{1000, L"返回"},
             {10, L"宠物缩小"},
@@ -63,7 +67,7 @@ std::vector<Item> Items() {
           {100, L"宠物大小"},     {101, L"会话面板"},
           {102, L"文字显示"},     {103, L"背景材质"},
           {14, L"恢复所有默认大小"},
-          {3, L"素材来源与许可"}, {4, L"退出桌宠"}};
+          {105,L"数据源"}, {3, L"素材来源与许可"}, {4, L"退出桌宠"}};
 }
 float Width() { return Inset * 2 + Cell * Items().size(); }
 int Hit(float x, float y) {
@@ -94,6 +98,7 @@ void Label(const std::wstring &value, float x, float y, float width, float size,
                     D2D1::RectF(x, y, x + width, y + 24), brush.Get(),
                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
+bool Selected(int id, const ToolbarState &s);
 void Icon(int id, float x, float y, ID2D1SolidColorBrush *b) {
   auto line = [&](float a, float c, float d, float e) {
     canvas->DrawLine(D2D1::Point2F(x + a, y + c), D2D1::Point2F(x + d, y + e),
@@ -213,6 +218,11 @@ void Icon(int id, float x, float y, ID2D1SolidColorBrush *b) {
     line(0, -9, 0, 0);
     return;
   }
+  if (id == 105 || id == 60 || id == 61) {
+    canvas->DrawEllipse(D2D1::Ellipse(D2D1::Point2F(x,y),8,8),b,1.6f);
+    if(id==105 || Selected(id,getState())){line(-4,0,-1,3);line(-1,3,5,-4);}
+    return;
+  }
   if (id == 1000) {
     line(2, -7, -5, 0);
     line(-5, 0, 2, 7);
@@ -252,6 +262,7 @@ void Icon(int id, float x, float y, ID2D1SolidColorBrush *b) {
         x - 18, y - 8, 36, 11, D2D1::ColorF(PetTheme::Muted), true);
 }
 bool Selected(int id, const ToolbarState &s) {
+  if(id==60||id==61)return DataSources()[id-60].enabled;
   return (id >= 30 && id <= 32 && id-30 == (int)s.backdrop) ||
          (id == 15 && s.pinned) || (id == 20 && !s.subpixel) ||
          (id == 21 && s.subpixel) ||
@@ -322,12 +333,14 @@ void Paint() {
                         : page == 2 ? L"会话面板"
                         : page == 3 ? L"文字显示"
                         : page == 4 ? L"背景材质 · " + std::wstring(BackdropName(state.backdrop))
+                        : page == 6 ? L"数据源 · 勾选启用，未安装时休眠"
                         : page == 5 ? L"最多显示最近会话"
                                     : L"会话与显示设置";
     if (page == 1)
       hint += L" · " + std::to_wstring(state.petSize);
     if (page == 2)
       hint += L" · " + std::to_wstring(state.panelPercent) + L"%";
+    if(page==6 && current>0 && current<=2)hint+=DataSources()[current-1].detected?L" · 已发现":L" · 未发现";
     if (page == 5)
       hint += L" · " + std::to_wstring(state.sessionRows) + L" 个";
     Label(hint, 8, 46, Width() - 16, 10, D2D1::ColorF(PetTheme::Muted), true);
@@ -361,8 +374,8 @@ void Activate(int index) {
   if (index < 0 || index >= (int)items.size() || !items[index].id)
     return;
   int id = items[index].id;
-  if (id == 100 || id == 101 || id == 102 || id == 103 || id == 104 || id == 1000) {
-    page = id == 100 ? 1 : id == 101 ? 2 : id == 102 ? 3 : id == 103 ? 4 : id == 104 ? 5 : page == 5 ? 2 : 0;
+  if (id == 100 || id == 101 || id == 102 || id == 103 || id == 104 || id == 105 || id == 1000) {
+    page = id == 105 ? 6 : id == 100 ? 1 : id == 101 ? 2 : id == 102 ? 3 : id == 103 ? 4 : id == 104 ? 5 : page == 5 ? 2 : 0;
     hovered = pressed = -1;
     focus = 0;
     ClearInteractionFeedback(window);

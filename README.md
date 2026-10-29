@@ -1,8 +1,10 @@
 # ZCode Pet
 
-原生 C++ / Win32 桌宠，只读观察已经运行的 ZCode 会话。角色使用 Spine 骨骼动画，无需修改 ZCode 安装包、源码、配置或启用调试端口，也不启动新 agent。
+原生 C++ / Win32 桌宠，通过独立数据源只读观察 ZCode 与 DeepSeek Harness 会话。角色使用 Spine 骨骼动画，无需修改 ZCode 安装包、源码、配置或启用调试端口，也不启动新 agent。
 
 [下载最新版本](https://github.com/Nakiha/Zcode-Pet/releases/latest) · [运行行为](spec/behavior.md) · [性能说明](docs/performance.md)
+
+开发版增加独立数据源：右键 → **数据源** 勾选 ZCode / DeepSeek Harness，启动自动探查，选择会保存。Harness 当前支持默认压缩的 v4 会话日志、运行/结束与审批等待状态；已用源码 Harness 运行时与本地 mock 验证运行→完成、气泡和宠物动作；插件特有状态与 Harness 点击跳转尚未适配。详细范围见[数据源说明](docs/data-sources.md)。
 
 ## 运行
 
@@ -55,7 +57,7 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-需要 Visual Studio C++ 和 Windows SDK（本机 10.0.26100）。构建产物为单个 EXE，CI 会复制到不含资源目录的路径中验证。18 项 CTest 覆盖观察器、展示、字形、边界/避让、浮层和交互动效、导航、提醒、保留式合成、栅格边界、Spine 状态/资源生命周期和时钟节拍。
+需要 Visual Studio C++ 和 Windows SDK（本机 10.0.26100）。构建产物为单个 EXE，CI 会复制到不含资源目录的路径中验证。19 项 CTest 覆盖数据源、观察器、展示、字形、边界/避让、浮层和交互动效、导航、提醒、保留式合成、栅格边界、Spine 状态/资源生命周期和时钟节拍。
 
 - `--licenses`：查看内嵌完整许可与素材来源；右键工具栏也可打开。
 - `--probe`：只读检查运行实例，写 EXE 旁的 `probe.txt`，包含实际后端、错误计数、帧率需求、托盘注册及会话行数，不输出会话内容。

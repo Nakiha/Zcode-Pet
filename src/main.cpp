@@ -1,3 +1,4 @@
+#include "data_sources.h"
 #include "embedded_assets.h"
 #include "text_raster.h"
 #include <windows.h>
@@ -244,13 +245,15 @@ void NavigationFeedback(NavigationCode code) {
     else if (code == NavigationCode::AppClosed ||
              code == NavigationCode::Unavailable)
       text = L"ZCode 未运行或会话信息不可用，暂时无法跳转。";
+    else if(code==NavigationCode::UnsupportedSource)
+      text=L"Harness 会话监控已接入，桌面跳转尚未适配，请在 Harness 中选择会话。";
     else if (code == NavigationCode::Missing)
       text = L"该会话已不在当前观察列表中，请在 ZCode 中查找。";
     else if (code == NavigationCode::FocusFailed)
       text = L"未能聚焦会话条目，请切回 ZCode 后重试。";
     icon.uFlags |= NIF_INFO;
     icon.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
-    wcscpy_s(icon.szInfoTitle, L"未能定位 ZCode 会话");
+    wcscpy_s(icon.szInfoTitle, L"未能定位会话");
     wcscpy_s(icon.szInfo, text);
   }
   Shell_NotifyIconW(NIM_MODIFY, &icon);
@@ -725,7 +728,7 @@ PanelScene CapturePanelScene(float width, float height) {
       continue;
     const auto &session = snapshot.sessions[i];
     scene.rows.push_back(
-        {session.title.empty() ? L"未命名会话" : session.title,
+        {(session.source==SourceId::DeepSeek?L"DS · ":L"")+ (session.title.empty() ? std::wstring(L"未命名会话") : session.title),
          stateClock.Age(session, now), Status(session),
          StateOf(session, snapshot.online), y,
          stateMotion.Offset(session, animationNow),
@@ -1577,6 +1580,7 @@ ToolbarState ToolbarValues() {
           (int)std::lround(panelZoom * 100), strength, backdropMode,sessionRows};
 }
 void ExecuteToolbarAction(int id) {
+  if(id==60 || id==61)ToggleDataSource(id==60?SourceId::ZCode:SourceId::DeepSeek);
   if (id >= 50 && id <= 52) {
     sessionRows = id == 52 ? DefaultSessionRows
                           : ClampSessionRows(sessionRows + (id == 51 ? 1 : -1));
@@ -2034,6 +2038,10 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
   return DefWindowProcW(h, msg, w, l);
 }
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
+  InitializeDataSources();
+  if(wcsstr(command,L"--source-diagnostic")){std::ofstream f("source-diagnostic.csv");f<<"sample,harness,running,completed,unknown,warning\n";for(int i=0;i<15;++i){auto snap=Observe();int count=0,running=0,completed=0,unknown=0;for(auto& row:snap.sessions)if(row.source==SourceId::DeepSeek){++count;running+=row.running;completed+=row.result==L"completed";unknown+=row.uncertain;}f<<i<<","<<count<<","<<running<<","<<completed<<","<<unknown<<","<<!snap.sourceWarning.empty()<<"\n";f.flush();Sleep(1000);}return 0;}
+  if(wcsstr(command,L"--source-benchmark"))return DataSourceTests(true)?0:1;
+  if(wcsstr(command,L"--data-sources-test"))return DataSourceTests()?0:1;
   if(wcsstr(command,L"--notice-reflow-test"))return NoticeReflowTests() ? 0 : 1;
   if(wcsstr(command,L"--frame-clock-test"))return FrameClockTimingTests() ? 0 : 1;
   if(wcsstr(command,L"--raster-test"))return SoftwareRasterTests() ? 0 : 1;

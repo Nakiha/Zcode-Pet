@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.24)
-project(ZCodePet VERSION 3.0.0 LANGUAGES CXX)
+project(ZCodePet VERSION 3.0.0 LANGUAGES C CXX)
 enable_language(RC)
 configure_file(src/resources.rc.in ${CMAKE_CURRENT_BINARY_DIR}/resources.rc @ONLY)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-add_executable(ZCodePet WIN32 src/main.cpp src/observer.cpp src/toolbar.cpp src/status_badge.cpp src/notice_close.cpp src/popup_motion.cpp src/frame_clock.cpp src/session_navigation.cpp src/interaction_motion.cpp src/panel_composition.cpp)
+add_executable(ZCodePet WIN32 src/main.cpp src/data_sources.cpp src/zcode_source.cpp src/deepseek_source.cpp src/toolbar.cpp src/status_badge.cpp src/notice_close.cpp src/popup_motion.cpp src/frame_clock.cpp src/session_navigation.cpp src/interaction_motion.cpp src/panel_composition.cpp)
 target_sources(ZCodePet PRIVATE ${CMAKE_CURRENT_BINARY_DIR}/resources.rc)
 target_sources(ZCodePet PRIVATE src/composition_device.cpp)
 file(GLOB SPINE_SOURCES CONFIGURE_DEPENDS third_party/spine-cpp/src/spine/*.cpp)
@@ -39,3 +39,8 @@ add_test(NAME embedded-assets COMMAND ZCodePet --embedded-assets-test)
 add_test(NAME standalone COMMAND ${CMAKE_COMMAND}
   "-DEXE=$<TARGET_FILE:ZCodePet>" "-DROOT=${CMAKE_BINARY_DIR}"
   -P "${CMAKE_SOURCE_DIR}/scripts/test-standalone.cmake")
+
+add_library(zstd-decoder STATIC third_party/zstd/zstddeclib.c)
+target_compile_options(zstd-decoder PRIVATE /W0)
+target_link_libraries(ZCodePet PRIVATE zstd-decoder)
+add_test(NAME data-sources COMMAND ZCodePet --data-sources-test)
