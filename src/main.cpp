@@ -1,3 +1,4 @@
+#include "embedded_assets.h"
 #include "text_raster.h"
 #include <windows.h>
 #include "observer.h"
@@ -145,10 +146,9 @@ bool experimental = false;
 float strength = .75f;
 std::wstring animationName;
 void LoadPreferences() {
-  wchar_t local[32768];
-  if (!GetEnvironmentVariableW(L"LOCALAPPDATA", local, 32768))
+  preferencesPath = PetSettingsFile();
+  if (preferencesPath.empty())
     return;
-  preferencesPath = fs::path(local) / L"ZCodePet/settings.ini";
   panelPinned = GetPrivateProfileIntW(L"UI", L"PinSessions", 0,
                                       preferencesPath.c_str()) != 0;
   backdropMode = ReadBackdropMode((int)GetPrivateProfileIntW(
@@ -957,14 +957,14 @@ bool InitializePetRenderer(bool hardware) {
   };
   spineHardware = hardware;
   applyStyle(hardware);
-  if (!spinePet.Initialize(pet, base / L"assets/spine", hardware)) {
+  if (!spinePet.Initialize(pet, hardware)) {
     if (!hardware)
       return false;
     // The optional D3D backend can recover through the same Spine software
     // renderer. Character resources are required in either path.
     spineHardware = false;
     applyStyle(false);
-    if (!spinePet.Initialize(pet, base / L"assets/spine", false))
+    if (!spinePet.Initialize(pet, false))
       return false;
   }
   if (SetAnimation(logical))
@@ -1606,10 +1606,7 @@ void ExecuteToolbarAction(int id) {
     InvalidateRect(panel, nullptr, FALSE);
   }
   if (id == 3) {
-    const auto credits = base / L"assets/spine/ATTRIBUTION.txt";
-    ShellExecuteW(nullptr, L"open",
-                  credits.c_str(), nullptr,
-                  nullptr, SW_SHOWNORMAL);
+    ShowEmbeddedLicenses(pet);
   }
   if (id >= 5 && id <= 7) {
     strength = id == 5 ? .5f : id == 6 ? .75f : 1.f;
@@ -2071,10 +2068,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
     }
     return 0;
   }
-  if(wcsstr(command,L"--spine-lifecycle-test"))return SpineLifecycleTests(base/L"assets/spine") ? 0 : 1;
-  if(wcsstr(command,L"--spine-model-test"))return SpineModelTests(base/L"assets/spine") ? 0 : 1;
+  if(wcsstr(command,L"--licenses")){ ShowEmbeddedLicenses(nullptr); return 0; }
+  if(wcsstr(command,L"--embedded-assets-test"))return EmbeddedAssetsTests() ? 0 : 1;
+  if(wcsstr(command,L"--spine-lifecycle-test"))return SpineLifecycleTests() ? 0 : 1;
+  if(wcsstr(command,L"--spine-model-test"))return SpineModelTests() ? 0 : 1;
   if (wcsstr(command,L"--spine-render-test"))
-    return RenderSpinePreview(base/L"assets/spine",base/(wcsstr(command,L"--software") ? L"spine-preview-soft" : L"spine-preview"),
+    return RenderSpinePreview(base/(wcsstr(command,L"--software") ? L"spine-preview-soft" : L"spine-preview"),
                                !wcsstr(command,L"--software")) ? 0 : 1;
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   if (wcsstr(command,L"--notice-test")) return NoticeModelTests() ? 0 : 1;
@@ -2405,7 +2404,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
   UpdateTrayIcon();
   spineHardware=wcsstr(command,L"--spine-gpu") || gpuProfileScene.find(L"spine-gpu")!=std::wstring::npos;
   if (!InitializePetRenderer(spineHardware)) {
-    MessageBoxW(nullptr, L"无法加载 Spine 角色，请保持完整的 assets/spine 目录与 EXE 在一起。",
+    MessageBoxW(nullptr, L"无法加载内嵌 Spine 角色资源，请重新下载完整的 EXE。",
                 L"ZCode Pet", MB_ICONERROR);
     DestroyWindow(pet);
   } else

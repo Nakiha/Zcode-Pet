@@ -11,8 +11,7 @@ class SpinePet {
 public:
   SpinePet();
   ~SpinePet();
-  bool Initialize(HWND window, const std::filesystem::path &folder,
-                  bool hardware = false) noexcept;
+  bool Initialize(HWND window, bool hardware = false) noexcept;
   bool Ready() const noexcept;
   bool SetClip(const std::string &name, bool loop = true) noexcept;
   bool SetState(const std::wstring &state) noexcept;
@@ -25,8 +24,7 @@ public:
   void Shutdown() noexcept;
   LRESULT Metric(unsigned field) const noexcept;
 };
-bool RenderSpinePreview(const std::filesystem::path &folder,
-                        const std::filesystem::path &output,
+bool RenderSpinePreview(const std::filesystem::path &output,
                         bool hardware = true);
-bool SpineModelTests(const std::filesystem::path &folder);
-bool SpineLifecycleTests(const std::filesystem::path &folder);
+bool SpineModelTests();
+bool SpineLifecycleTests();

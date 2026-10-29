@@ -1,4 +1,6 @@
 #include "spine_pet.h"
+#include "embedded_assets.h"
+#include "resource.h"
 #include "composition_device.h"
 #include "software_raster.h"
 #include "pet_canvas.h"
@@ -11,7 +13,6 @@
 #include <windows.ui.composition.interop.h>
 #include <winrt/Windows.UI.Composition.Desktop.h>
 #include <winrt/Windows.Foundation.h>
-#include <fstream>
 #include <cmath>
 #include <algorithm>
 #include <array>
@@ -23,34 +24,10 @@ using namespace winrt::Windows::UI::Composition;
 namespace Interop = ABI::Windows::UI::Composition;
 namespace fs = std::filesystem;
 namespace {
-fs::path WindowsPath(const char *path) {
-  return fs::path(std::u8string_view(reinterpret_cast<const char8_t *>(path)));
-}
 std::string Utf8(const fs::path &path) {
   const auto s = path.u8string();
   return {reinterpret_cast<const char *>(s.data()), s.size()};
 }
-struct WindowsSpineExtension : spine::DefaultSpineExtension {
-  char *_readFile(const spine::String &name, int *length) override {
-    std::ifstream input(WindowsPath(name.buffer()),
-                        std::ios::binary | std::ios::ate);
-    if (!input) {
-      *length = 0;
-      return nullptr;
-    }
-    const auto size = input.tellg();
-    if (size < 0 || size > 64 * 1024 * 1024) {
-      *length = 0;
-      return nullptr;
-    }
-    *length = (int)size;
-    auto data = (char *)_alloc((size_t)*length + 1, __FILE__, __LINE__);
-    input.seekg(0);
-    input.read(data, *length);
-    data[*length] = 0;
-    return data;
-  }
-};
 struct Texture : SoftwareTexture {
   ComPtr<ID3D11ShaderResourceView> view;
 };
@@ -63,9 +40,15 @@ struct TextureLoader : spine::TextureLoader {
   }
   void load(spine::AtlasPage &page, const spine::String &path) override {
     ComPtr<IWICBitmapDecoder> decoder;
-    check_hresult(wic->CreateDecoderFromFilename(
-        WindowsPath(path.buffer()).c_str(), nullptr, GENERIC_READ,
-        WICDecodeMetadataCacheOnLoad, &decoder));
+    if (path != "leimi.png")
+      throw_hresult(E_INVALIDARG);
+    const auto png = EmbeddedBytes(IDR_PET_PNG);
+    ComPtr<IWICStream> stream;
+    check_hresult(wic->CreateStream(&stream));
+    check_hresult(stream->InitializeFromMemory(const_cast<BYTE *>(png.data()),
+                                               (DWORD)png.size()));
+    check_hresult(wic->CreateDecoderFromStream(
+        stream.Get(), nullptr, WICDecodeMetadataCacheOnLoad, &decoder));
     ComPtr<IWICBitmapFrameDecode> frame;
     check_hresult(decoder->GetFrame(0, &frame));
     ComPtr<IWICFormatConverter> converter;
@@ -77,7 +60,12 @@ struct TextureLoader : spine::TextureLoader {
     check_hresult(frame->GetSize(&width, &height));
     if (!width || !height || width > 8192 || height > 8192)
       throw_hresult(E_INVALIDARG);
-    std::vector<BYTE> pixels((size_t)width * height * 4);
+    auto resource = std::make_unique<Texture>();
+    resource->width = (int)width;
+    resource->height = (int)height;
+    resource->rgba.resize((size_t)width * height);
+    auto pixels = std::span(reinterpret_cast<BYTE *>(resource->rgba.data()),
+                            resource->rgba.size() * 4);
     check_hresult(converter->CopyPixels(nullptr, width * 4, (UINT)pixels.size(),
                                         pixels.data()));
     if (page.pma)
@@ -97,15 +85,12 @@ struct TextureLoader : spine::TextureLoader {
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     D3D11_SUBRESOURCE_DATA source{pixels.data(), width * 4, 0};
     ComPtr<ID3D11Texture2D> texture;
-    auto resource = std::make_unique<Texture>();
-    resource->width = (int)width;
-    resource->height = (int)height;
-    resource->rgba.resize((size_t)width * height);
-    memcpy(resource->rgba.data(), pixels.data(), pixels.size());
+
     if (device) {
       check_hresult(device->CreateTexture2D(&desc, &source, &texture));
       check_hresult(device->CreateShaderResourceView(texture.Get(), nullptr,
                                                      &resource->view));
+      std::vector<uint32_t>().swap(resource->rgba);
     }
     page.width = (int)width;
     page.height = (int)height;
@@ -142,7 +127,7 @@ std::array<float, 4> Color(uint32_t c) {
 }
 } // namespace
 spine::SpineExtension *spine::getDefaultExtension() {
-  return new WindowsSpineExtension();
+  return new spine::DefaultSpineExtension();
 }
 struct SpinePet::Impl {
   bool ready = false;
@@ -438,8 +423,7 @@ struct SpinePet::Impl {
 };
 SpinePet::SpinePet() : impl(std::make_unique<Impl>()) {}
 SpinePet::~SpinePet() { Shutdown(); }
-bool SpinePet::Initialize(HWND window, const fs::path &folder,
-                          bool hardware) noexcept {
+bool SpinePet::Initialize(HWND window, bool hardware) noexcept {
   auto &s = *impl;
   try {
     s.hardware = hardware;
@@ -465,22 +449,27 @@ bool SpinePet::Initialize(HWND window, const fs::path &folder,
                        SWP_FRAMECHANGED);
     }
     s.loader = std::make_unique<TextureLoader>(s.device.Get());
+    const auto atlas = EmbeddedBytes(IDR_PET_ATLAS);
     s.atlas = std::make_unique<spine::Atlas>(
-        Utf8(folder / L"leimi.atlas").c_str(), s.loader.get());
+        reinterpret_cast<const char *>(atlas.data()), (int)atlas.size(), "",
+        s.loader.get());
     spine::SkeletonJson parser(s.atlas.get());
-    s.data.reset(
-        parser.readSkeletonDataFile(Utf8(folder / L"remilia.json").c_str()));
+    s.data.reset(parser.readSkeletonData(EmbeddedText(IDR_PET_JSON).c_str()));
     if (!s.data)
       throw_hresult(E_INVALIDARG);
     s.skeleton = std::make_unique<spine::Skeleton>(s.data.get());
     s.mixes = std::make_unique<spine::AnimationStateData>(s.data.get());
     s.mixes->setDefaultMix(.22f);
     s.state = std::make_unique<spine::AnimationState>(s.mixes.get());
-    const auto config = folder / L"animations.ini";
+    const auto config = PetSettingsFile();
     const std::pair<const wchar_t *, const wchar_t *> defaults[] = {
-        {L"idle", L"a"},     {L"working", L"d"},         {L"waiting", L"e"},
-        {L"success", L"c"},  {L"paused", L"b"},
-        {L"drag", L"a_win"}, {L"drag_working", L"d_win"}};
+        {L"idle", L"a"},
+        {L"working", L"d"},
+        {L"waiting", L"e"},
+        {L"success", L"c"},
+        {L"paused", L"b"},
+        {L"drag", L"a_win"},
+        {L"drag_working", L"d_win"}};
     for (const auto &[logical, original] : defaults) {
       wchar_t value[128]{};
       GetPrivateProfileStringW(L"animations", logical, original, value, 128,
@@ -749,8 +738,7 @@ LRESULT SpinePet::Metric(unsigned f) const noexcept {
          : f == 6 ? (LRESULT)s.errors
                   : s.ready && s.hardware;
 }
-bool RenderSpinePreview(const fs::path &folder, const fs::path &output,
-                        bool hardware) {
+bool RenderSpinePreview(const fs::path &output, bool hardware) {
   const auto hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   if (FAILED(hr))
     return false;
@@ -763,7 +751,7 @@ bool RenderSpinePreview(const fs::path &folder, const fs::path &output,
                                 type.lpszClassName, L"", WS_POPUP, 0, 0, 512,
                                 512, nullptr, nullptr, type.hInstance, nullptr);
   SpinePet pet;
-  bool okay = pet.Initialize(window, folder, hardware);
+  bool okay = pet.Initialize(window, hardware);
   fs::create_directories(output);
   for (const auto &name : pet.Clips()) {
     okay &= pet.SetClip(name);
@@ -789,7 +777,7 @@ bool RenderSpinePreview(const fs::path &folder, const fs::path &output,
   CoUninitialize();
   return okay;
 }
-bool SpineModelTests(const fs::path &folder) {
+bool SpineModelTests() {
   struct TestTextures : spine::TextureLoader {
     void load(spine::AtlasPage &page, const spine::String &) override {
       page.texture = &page;
@@ -797,10 +785,12 @@ bool SpineModelTests(const fs::path &folder) {
     void unload(void *) override {}
   } textures;
   try {
-    spine::Atlas atlas(Utf8(folder / L"leimi.atlas").c_str(), &textures);
+    const auto bytes = EmbeddedBytes(IDR_PET_ATLAS);
+    spine::Atlas atlas(reinterpret_cast<const char *>(bytes.data()),
+                       (int)bytes.size(), "", &textures);
     spine::SkeletonJson parser(&atlas);
     std::unique_ptr<spine::SkeletonData> data(
-        parser.readSkeletonDataFile(Utf8(folder / L"remilia.json").c_str()));
+        parser.readSkeletonData(EmbeddedText(IDR_PET_JSON).c_str()));
     if (!data || data->getAnimations().size() < 5)
       return false;
     spine::Skeleton skeleton(data.get());
@@ -833,14 +823,12 @@ bool SpineModelTests(const fs::path &folder) {
           return false;
       }
     }
-    std::unique_ptr<spine::SkeletonData> missing(
-        parser.readSkeletonDataFile(Utf8(folder / L"missing.json").c_str()));
-    return !missing;
+    return true;
   } catch (...) {
     return false;
   }
 }
-bool SpineLifecycleTests(const fs::path &folder) {
+bool SpineLifecycleTests() {
   const auto hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
   if (FAILED(hr))
     return false;
@@ -856,7 +844,7 @@ bool SpineLifecycleTests(const fs::path &folder) {
   SpinePet pet;
   DWORD baseline = 0;
   for (int cycle = 0; okay && cycle < 8; ++cycle) {
-    okay = pet.Initialize(window, folder, false) && pet.DesiredFps() == 30;
+    okay = pet.Initialize(window, false) && pet.DesiredFps() == 30;
     // An animation that has never been applied has no visible source pose to
     // mix from. Match the app startup: draw idle before changing state.
     okay &= pet.Render(0, 224);
@@ -893,7 +881,7 @@ bool SpineLifecycleTests(const fs::path &folder) {
     else
       okay &= resources <= baseline + 1;
   }
-  okay &= !pet.Initialize(window, folder / L"missing", false) && !pet.Ready();
+  okay &= !pet.Ready();
   pet.Shutdown();
   if (window)
     DestroyWindow(window);

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(ZCodePet VERSION 0.2.5 LANGUAGES CXX)
+project(ZCodePet VERSION 3.0.0 LANGUAGES CXX)
 enable_language(RC)
 configure_file(src/resources.rc.in ${CMAKE_CURRENT_BINARY_DIR}/resources.rc @ONLY)
 set(CMAKE_CXX_STANDARD 20)
@@ -11,17 +11,11 @@ file(GLOB SPINE_SOURCES CONFIGURE_DEPENDS third_party/spine-cpp/src/spine/*.cpp)
 add_library(spine-cpp STATIC ${SPINE_SOURCES})
 target_include_directories(spine-cpp PUBLIC third_party/spine-cpp/include)
 target_compile_options(spine-cpp PRIVATE /utf-8 /EHsc /W0)
-target_sources(ZCodePet PRIVATE src/spine_pet.cpp)
+target_sources(ZCodePet PRIVATE src/spine_pet.cpp src/embedded_assets.cpp)
 target_link_libraries(ZCodePet PRIVATE spine-cpp d3dcompiler windowscodecs)
 target_compile_definitions(ZCodePet PRIVATE UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN)
 target_compile_options(ZCodePet PRIVATE /utf-8 /W4 /EHsc)
 target_link_libraries(ZCodePet PRIVATE d2d1 dwrite dwmapi gdiplus shell32 ole32 oleaut32 user32 gdi32 dxgi uiautomationcore d3d11 windowsapp CoreMessaging)
-add_custom_command(TARGET ZCodePet POST_BUILD
-  COMMAND ${CMAKE_COMMAND}
-    "-DSOURCE_ASSETS=${CMAKE_SOURCE_DIR}/assets"
-    "-DTARGET_ASSETS=$<TARGET_FILE_DIR:ZCodePet>/assets"
-    "-DBINARY_ROOT=${CMAKE_BINARY_DIR}"
-    -P "${CMAKE_SOURCE_DIR}/scripts/copy-assets.cmake")
 enable_testing()
 add_test(NAME observer COMMAND ZCodePet --self-test)
 add_test(NAME presentation COMMAND ZCodePet --presentation-test)
@@ -40,3 +34,8 @@ add_test(NAME spine-model COMMAND ZCodePet --spine-model-test)
 add_test(NAME frame-clock COMMAND ZCodePet --frame-clock-test)
 add_test(NAME spine-lifecycle COMMAND ZCodePet --spine-lifecycle-test)
 add_test(NAME notice-reflow COMMAND ZCodePet --notice-reflow-test)
+
+add_test(NAME embedded-assets COMMAND ZCodePet --embedded-assets-test)
+add_test(NAME standalone COMMAND ${CMAKE_COMMAND}
+  "-DEXE=$<TARGET_FILE:ZCodePet>" "-DROOT=${CMAKE_BINARY_DIR}"
+  -P "${CMAKE_SOURCE_DIR}/scripts/test-standalone.cmake")

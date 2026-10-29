@@ -6,7 +6,7 @@
 
 ## 运行
 
-Windows 11 x64，目标最低系统版本 26200.8875。解压便携包，保持 `assets` 与 `ZCodePet.exe` 同目录，双击 EXE。完整的 `assets/spine` 为必需资源；资源不可用时明确报错。
+Windows 11 x64，目标最低系统版本 26200.8875。3.0 起直接下载并运行单个 EXE。Spine 骨骼、图集、纹理、图标和完整许可均内嵌，无需旁置 assets、DLL 或解压临时资源。
 
 无需 WinUI、Windows App SDK、WebView2、Python、Node 或额外 VC 运行库。设置保存在 `%LOCALAPPDATA%/ZCodePet/settings.ini`。
 
@@ -24,7 +24,7 @@ Windows 11 x64，目标最低系统版本 26200.8875。解压便携包，保持 
 
 ## Spine 动画与渲染
 
-使用 Spine 4.2.43 导出及固定版本的官方 spine-cpp 4.2，来源见 `third_party/spine-cpp/UPSTREAM.txt`。动作以 AnimationState 混合衔接，默认 0.22 秒，映射与帧率可在 `assets/spine/animations.ini` 调整。
+使用 Spine 4.2.43 导出及固定版本的官方 spine-cpp 4.2，来源见 `third_party/spine-cpp/UPSTREAM.txt`。动作以 AnimationState 混合衔接，默认 0.22 秒，映射与帧率可在 `%LOCALAPPDATA%/ZCodePet/settings.ini` 的 `[animations]`、`[mixing]`、`[playback]` 节调整（示例见源码 `assets/spine/animations.ini`）。
 
 | 状态 | 动画 |
 |---|---|
@@ -55,8 +55,9 @@ cmake --build build --config Release
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-需要 Visual Studio C++ 和 Windows SDK（本机 10.0.26100）。构建时刷新专属输出目录内的 assets，避免旧素材残留。16 项 CTest 覆盖观察器、展示、字形、边界/避让、浮层和交互动效、导航、提醒、保留式合成、栅格边界、Spine 状态/资源生命周期和时钟节拍。
+需要 Visual Studio C++ 和 Windows SDK（本机 10.0.26100）。构建产物为单个 EXE，CI 会复制到不含资源目录的路径中验证。18 项 CTest 覆盖观察器、展示、字形、边界/避让、浮层和交互动效、导航、提醒、保留式合成、栅格边界、Spine 状态/资源生命周期和时钟节拍。
 
+- `--licenses`：查看内嵌完整许可与素材来源；右键工具栏也可打开。
 - `--probe`：只读检查运行实例，写 EXE 旁的 `probe.txt`，包含实际后端、错误计数、帧率需求、托盘注册及会话行数，不输出会话内容。
 - `--panel` / `--quit`：展开面板启动 / 正常退出已运行实例。
 - `--demo --preview --panel`：本地合成事件验证多提醒、重命名、回弹之外的状态切换及新轮清理，不向 ZCode 发任务。
@@ -69,7 +70,7 @@ ctest --test-dir build -C Release --output-on-failure
 
 Spine 角色资源由用户提供的 `Q版蕾米.zip` 导出，原包没有单独美术许可，本项目不另行授予角色使用权。来源见 `assets/spine/ATTRIBUTION.txt`。
 
-**Spine runtime 不是 MIT 或宽松许可证。** 使用与分发须遵守随附的完整官方协议；若无适用 Spine Editor 许可覆盖，协议要求每个产品使用者自行取得 Spine Editor 许可。详见 [官方运行时许可](https://esotericsoftware.com/spine-runtimes-license)、`third_party/spine-cpp/LICENSE` 和 `assets/spine/SPINE-RUNTIME-LICENSE.txt`。
+**Spine runtime 不是 MIT 或宽松许可证。** 使用与分发须遵守内嵌的完整官方协议；若无适用 Spine Editor 许可覆盖，协议要求每个产品使用者自行取得 Spine Editor 许可。详见 [官方运行时许可](https://esotericsoftware.com/spine-runtimes-license)、`third_party/spine-cpp/LICENSE` 和 `assets/spine/SPINE-RUNTIME-LICENSE.txt`。
 
 JSON 解析使用 nlohmann/json 3.11.3（MIT），完整许可位于 `third_party/json.LICENSE`。其余系统图形、数据库与 UI Automation 组件来自 Windows。
 

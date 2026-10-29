@@ -41,7 +41,7 @@ try {
       $taskNow=$taskClock.Elapsed.TotalMilliseconds
       $taskPercent=100*($taskCpu-$taskPrevious)/($taskNow-$taskLast)/$taskCores
       $taskValues.Add($taskPercent)
-      $taskRows.Add([pscustomobject]@{Build=$taskMode;Sample=$taskSample;CpuPercent=$taskPercent;CpuMs=$taskCpu-$taskPrevious;ElapsedMs=$taskNow-$taskLast})
+      $taskRows.Add([pscustomobject]@{Build=$taskMode;Sample=$taskSample;CpuPercent=$taskPercent;CpuMs=$taskCpu-$taskPrevious;ElapsedMs=$taskNow-$taskLast;WorkingMiB=$taskProcess.WorkingSet64/1MB;PrivateMiB=$taskProcess.PrivateMemorySize64/1MB;PeakWorkingMiB=$taskProcess.PeakWorkingSet64/1MB})
       $taskPrevious=$taskCpu;$taskLast=$taskNow
     }
     $taskSorted=@($taskValues | Sort-Object)

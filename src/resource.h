@@ -1,2 +1,10 @@
 #pragma once
 #define IDI_ZCODEPET 101
+#define IDR_PET_JSON 201
+#define IDR_PET_ATLAS 202
+#define IDR_PET_PNG 203
+#define IDR_SPINE_LICENSE 204
+#define IDR_JSON_LICENSE 205
+#define IDR_PET_CREDITS 206
+#define IDD_LICENSES 301
+#define IDC_LICENSE_TEXT 302
