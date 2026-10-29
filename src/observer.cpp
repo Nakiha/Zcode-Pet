@@ -149,6 +149,56 @@ void ReadQuestionsFromDb(Sqlite &sql, Snapshot &snapshot) {
   }
   sql.finalize(stmt);
 }
+void ReadProjectMetadata(Sqlite &sql, Snapshot &snapshot) {
+  for (auto &session : snapshot.sessions) {
+    session.projectMetadataKnown = true;
+    session.projectId.clear();
+    session.projectDisplayName.clear();
+    session.projectNameAmbiguous = false;
+  }
+  void *schema = nullptr;
+  if (sql.prepare(sql.db,
+      "SELECT EXISTS(SELECT 1 FROM pragma_table_info('tasks') WHERE name='project_id') "
+      "AND EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='projects')",
+      -1, &schema, nullptr) != 0)
+    return;
+  const int schemaResult = sql.step(schema);
+  const bool legacy = schemaResult == 100 && sql.integer(schema, 0) == 0;
+  sql.finalize(schema);
+  if (legacy) {
+    for (auto &session : snapshot.sessions)
+      session.projectMetadataKnown = false;
+    return;
+  }
+  if (schemaResult != 100)
+    return;
+  const char *query = R"SQL(SELECT t.workspace_key,t.task_id,coalesce(t.project_id,''),
+ CASE WHEN p.deleted=0 THEN p.name ELSE '' END,
+ (SELECT count(*) FROM projects q WHERE q.deleted=0 AND q.name=p.name COLLATE NOCASE)
+ FROM tasks t LEFT JOIN projects p ON p.project_id=t.project_id
+ WHERE t.deleted=0 AND t.archived=0 ORDER BY t.updated_at DESC LIMIT 40)SQL";
+  void *stmt = nullptr;
+  if (sql.prepare(sql.db, query, -1, &stmt, nullptr) != 0)
+    return; // Metadata failures must not fall back to a guessed directory label.
+  struct Record { std::wstring workspace, id, project, name; bool ambiguous; };
+  std::vector<Record> records;
+  int rc;
+  while ((rc = sql.step(stmt)) == 100)
+    records.push_back({sql.text(stmt, 0), sql.text(stmt, 1), sql.text(stmt, 2),
+                       sql.text(stmt, 3), sql.integer(stmt, 4) > 1});
+  sql.finalize(stmt);
+  if (rc != 101)
+    return;
+  for (auto &session : snapshot.sessions) {
+    for (const auto &record : records)
+      if (session.workspace == record.workspace && session.id == record.id) {
+        session.projectId = record.project;
+        session.projectDisplayName = record.name;
+        session.projectNameAmbiguous = record.ambiguous;
+        break;
+      }
+  }
+}
 void ReadRunningFallback(Sqlite &sql, Snapshot &snapshot, int64_t processStart) {
   if (!snapshot.online || !processStart || !sql.bind)
     return;
@@ -371,6 +421,7 @@ Snapshot Observe() {
     out.error = L"会话索引暂时忙碌，稍后重试";
     return out;
   }
+  ReadProjectMetadata(sql, out);
   if (start) {
     SYSTEMTIME t;
     GetLocalTime(&t);
@@ -533,6 +584,39 @@ bool ObserverTests() {
   ReadRunningFallback(fixture, fallback, 900);
   if (fallback.sessions[0].running)
     return false; // Never inspect running parts belonging to older messages.
+  ReadProjectMetadata(fixture, fallback);
+  if (fallback.sessions[0].projectMetadataKnown)
+    return false; // Confirmed old schema keeps the old directory-label behavior.
+  if (!exec("CREATE TABLE projects(project_id TEXT,name TEXT,deleted INTEGER)") ||
+      !exec("CREATE TABLE tasks(workspace_key TEXT,task_id TEXT,project_id TEXT,deleted INTEGER,archived INTEGER,updated_at INTEGER)") ||
+      !exec("INSERT INTO projects VALUES('p1','bilibili-report',0),('p2','other-report',0)") ||
+      !exec("INSERT INTO tasks VALUES('w','a','p1',0,0,2),('w','b','p2',0,0,1)"))
+    return false;
+  Snapshot projects;
+  Session projectRow;
+  projectRow.id=L"a"; projectRow.workspace=L"w"; projectRow.path=L"C:/bilibili-project";
+  auto otherProject=projectRow; otherProject.id=L"b";
+  projects.sessions={projectRow,otherProject};
+  ReadProjectMetadata(fixture, projects);
+  if (!projects.sessions[0].projectMetadataKnown ||
+      projects.sessions[0].projectDisplayName!=L"bilibili-report" ||
+      projects.sessions[1].projectDisplayName!=L"other-report")
+    return false;
+  if (!exec("UPDATE projects SET name='renamed' WHERE project_id='p1'"))
+    return false;
+  ReadProjectMetadata(fixture, projects);
+  if (projects.sessions[0].projectDisplayName!=L"renamed")
+    return false;
+  if (!exec("UPDATE projects SET name='RENAMED' WHERE project_id='p2'"))
+    return false;
+  ReadProjectMetadata(fixture, projects);
+  if (!projects.sessions[0].projectNameAmbiguous || !projects.sessions[1].projectNameAmbiguous)
+    return false;
+  if (!exec("UPDATE projects SET deleted=1 WHERE project_id='p1'"))
+    return false;
+  ReadProjectMetadata(fixture, projects);
+  if (!projects.sessions[0].projectDisplayName.empty())
+    return false;
   std::map<std::wstring, Activity> e;
   Apply(e, {{"sessionId", "a"}, {"kind", "turn-started"}, {"turnId", "t1"}},
         100);

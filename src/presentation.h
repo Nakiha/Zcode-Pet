@@ -16,6 +16,28 @@ enum class SessionState {
   Interrupted,
   Unknown
 };
+inline void StabilizeActiveSessionOrder(Snapshot &next, const Snapshot &previous) {
+  auto bucket = [](const Session &s) { return s.waiting ? 2 : s.running ? 1 : 0; };
+  using Key = std::pair<std::wstring, std::wstring>;
+  std::map<Key, std::pair<int, size_t>> ranks;
+  for (size_t i = 0; i < previous.sessions.size(); ++i) {
+    const auto &s = previous.sessions[i];
+    ranks.emplace(Key{s.workspace, s.id}, std::pair{bucket(s), i});
+  }
+  auto rank = [&](const Session &s) -> int {
+    const auto found = ranks.find({s.workspace, s.id});
+    return found != ranks.end() && found->second.first == bucket(s)
+               ? (int)found->second.second : -1;
+  };
+  std::stable_sort(next.sessions.begin(), next.sessions.end(),
+                   [&](const Session &a, const Session &b) {
+    if (bucket(a) != bucket(b))
+      return bucket(a) > bucket(b);
+    if (!bucket(a))
+      return false; // Resting sessions retain database recency order.
+    return rank(a) < rank(b); // New entrants first; existing rows stay put.
+  });
+}
 inline SessionState StateOf(const Session &s, bool online) {
   if (!online)
     return SessionState::Offline;
@@ -265,6 +287,33 @@ struct HoverPolicy {
   }
 };
 inline bool PresentationTests() {
+  Snapshot ordered;
+  Session first, second, added;
+  first.id=L"one"; first.workspace=L"w"; first.running=true;
+  second=first; second.id=L"two";
+  added=first; added.id=L"three";
+  ordered.sessions={first,second};
+  for(int poll=0;poll<20;++poll) {
+    Snapshot incoming;
+    incoming.sessions=poll%2 ? std::vector<Session>{first,second}
+                             : std::vector<Session>{second,first};
+    incoming.sessions[0].updated=1000+poll;
+    StabilizeActiveSessionOrder(incoming,ordered);
+    if(incoming.sessions[0].id!=L"one" || incoming.sessions[1].id!=L"two")
+      return false;
+    ordered=incoming;
+  }
+  Snapshot incoming;
+  incoming.sessions={second,added,first};
+  StabilizeActiveSessionOrder(incoming,ordered);
+  if(incoming.sessions[0].id!=L"three" || incoming.sessions[1].id!=L"one")
+    return false;
+  ordered=incoming;
+  incoming.sessions={first,second,added};
+  incoming.sessions[1].waiting=true;
+  StabilizeActiveSessionOrder(incoming,ordered);
+  if(incoming.sessions[0].id!=L"two" || incoming.sessions[1].id!=L"three")
+    return false;
   PanelFramePolicy frames;
   if (frames.Tick(true, true, false) || !frames.NeedsFrames(true))
     return false;

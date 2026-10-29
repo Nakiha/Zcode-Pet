@@ -209,7 +209,7 @@ NavigationResult Open(IUIAutomation *uia, const Session &session, const std::vec
     ComPtr<IUIAutomationElement> row;
   };
   std::vector<Match> matches;
-  const auto project = ProjectName(session.path);
+  const auto project = NavigationProjectName(session);
   for (HWND window : windows) {
     if (stopping || GetTickCount64() > deadline)
       return {NavigationCode::Cancelled};

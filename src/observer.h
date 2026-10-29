@@ -13,6 +13,8 @@ struct Session {
   bool waiting = false;
   std::wstring interactionId, questionPreview;
   int64_t waitingSince = 0, resumedAt = 0;
+  std::wstring projectId, projectDisplayName;
+  bool projectMetadataKnown = false, projectNameAmbiguous = false;
 };
 struct Snapshot {
   std::vector<Session> sessions;

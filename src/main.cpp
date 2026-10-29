@@ -1900,6 +1900,7 @@ LRESULT CALLBACK PetProc(HWND h, UINT msg, WPARAM w, LPARAM l) {
                 pausedUntil = GetTickCount64() + 4000;
       stateMotion.Update(pending, (uint64_t)VisualClockMs(),
                          IsWindowVisible(panel));
+      StabilizeActiveSessionOrder(pending, snapshot);
       snapshot = std::move(pending);
       stateClock.Update(snapshot, WallClockMs());
       if (navigationPreview && !snapshot.sessions.empty()) {
@@ -2022,6 +2023,17 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR command, int) {
       << std::count_if(s.sessions.begin(), s.sessions.end(),
                        [](const auto &row) { return row.waiting; })
       << " error=" << (!s.error.empty()) << "\n";
+    f << "projectMetadataKnown="
+      << std::count_if(s.sessions.begin(), s.sessions.end(),
+                      [](const auto &row) { return row.projectMetadataKnown; })
+      << " projectDisplayNames="
+      << std::count_if(s.sessions.begin(), s.sessions.end(),
+                      [](const auto &row) { return !row.projectDisplayName.empty(); })
+      << " projectDisplayOverrides="
+      << std::count_if(s.sessions.begin(), s.sessions.end(), [](const auto &row) {
+           return !row.projectDisplayName.empty() &&
+                  !SameProject(row.projectDisplayName, ProjectName(row.path));
+         }) << "\n";
     HWND character = FindWindowW(L"ZCodePet.Native", L"ZCode Pet");
     RECT petBounds{};
     MONITORINFO monitor{sizeof(monitor)};

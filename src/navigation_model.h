@@ -41,6 +41,10 @@ inline bool SameProject(const std::wstring &a, const std::wstring &b) {
     return towlower(x) == towlower(y);
   });
 }
+inline std::wstring NavigationProjectName(const Session &session) {
+  return session.projectMetadataKnown ? session.projectDisplayName
+                                      : ProjectName(session.path);
+}
 inline bool AccessibleSessionName(const std::wstring &name, const Session &target,
                                   const std::vector<Session> &peers) {
   if (target.title.empty() || !name.starts_with(target.title))
@@ -48,7 +52,7 @@ inline bool AccessibleSessionName(const std::wstring &name, const Session &targe
   if (name == target.title)
     return true;
   for (const auto &peer : peers)
-    if (SameProject(ProjectName(peer.path), ProjectName(target.path)) &&
+    if (SameProject(NavigationProjectName(peer), NavigationProjectName(target)) &&
         peer.title.size() > target.title.size() && name.starts_with(peer.title))
       return false;
   auto suffix = name.substr(target.title.size());
@@ -83,11 +87,13 @@ inline NavigationPreparation PrepareNavigation(const Session &captured,
   if (found == latest.sessions.end())
     return {NavigationCode::Missing, {}};
   if (found->id.empty() || found->workspace.empty() || found->title.empty() ||
-      ProjectName(found->path).empty())
+      NavigationProjectName(*found).empty())
     return {NavigationCode::Unavailable, {}};
+  if (found->projectNameAmbiguous)
+    return {NavigationCode::Ambiguous, {}};
   for (const auto &s : latest.sessions)
     if (!SameSession(s, *found) && s.title == found->title &&
-        SameProject(ProjectName(s.path), ProjectName(found->path)))
+        SameProject(NavigationProjectName(s), NavigationProjectName(*found)))
       return {NavigationCode::Ambiguous, {}};
   return {NavigationCode::Idle, *found};
 }
@@ -98,6 +104,30 @@ inline int SessionRowAt(float y, float height, int scroll, size_t count) {
   return row >= 0 && (size_t)row < count ? row : -1;
 }
 inline bool NavigationModelTests() {
+  Session renamed;
+  renamed.id = L"renamed";
+  renamed.workspace = L"workspace-id";
+  renamed.path = L"C:/bilibili-project";
+  renamed.title = L"report session";
+  renamed.projectMetadataKnown = true;
+  renamed.projectId = L"project-id";
+  renamed.projectDisplayName = L"bilibili-report";
+  Snapshot renamedSnapshot;
+  renamedSnapshot.online = true;
+  renamedSnapshot.sessions = {renamed};
+  if (NavigationProjectName(renamed) != L"bilibili-report" ||
+      PrepareNavigation(renamed, renamedSnapshot).code != NavigationCode::Idle)
+    return false;
+  renamedSnapshot.sessions[0].projectDisplayName = L"report renamed again";
+  if (NavigationProjectName(PrepareNavigation(renamed, renamedSnapshot).session) !=
+      L"report renamed again")
+    return false;
+  renamedSnapshot.sessions[0].projectNameAmbiguous = true;
+  if (PrepareNavigation(renamed, renamedSnapshot).code != NavigationCode::Ambiguous)
+    return false;
+  renamedSnapshot.sessions[0].projectDisplayName.clear();
+  if (PrepareNavigation(renamed, renamedSnapshot).code != NavigationCode::Unavailable)
+    return false;
   Session named;
   named.title = L"字节266";
   named.path = L"C:/Project";
